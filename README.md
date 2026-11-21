@@ -152,6 +152,35 @@ mod no genera árboles). Si algo falta, el job falla en vez de publicar un build
 > Estado: el build de esta rama ya corrió en GitHub Actions y terminó en verde
 > (artifact `tanshugetrees-jar`, 64.382.741 bytes).
 
+### Descarga directa (PowerShell, sin login)
+
+La release [`v1.1-configmods`](https://github.com/Santi-PdR/Config-Mods/releases/tag/v1.1-configmods) es
+pública; el jar se baja con `Invoke-WebRequest` y se verifica tamaño + SHA-256 antes de instalarlo:
+
+```powershell
+$inst='D:\Minecraft\SKLauncher\sklauncher-data-v4\instances\test-1'
+$d="$inst\mods"; $n='TansHugeTrees-1.8.0-Forge-1.20.1-configmods.jar'; $s=64550946
+$h='2ea601b22fb1730fe8b463459f4d491783207c362ae3b346169bcf360ef3e6e3'
+Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/Santi-PdR/Config-Mods/releases/download/v1.1-configmods/$n" -OutFile "$env:TEMP\$n"
+if ((Get-Item "$env:TEMP\$n").Length -ne $s) { 'TAMAÑO MAL' } else { (Get-FileHash "$env:TEMP\$n" -Algorithm SHA256).Hash }
+Remove-Item "$d\TansHugeTrees-*.jar" -Force -ErrorAction SilentlyContinue
+Move-Item -Force "$env:TEMP\$n" $d
+```
+
+Listo para usar (con verificación que corta si algo no coincide y limpia builds viejos del mod):
+
+```powershell
+# Windows
+.\scripts\install-tht.ps1 -Instance 'D:\Minecraft\SKLauncher\sklauncher-data-v4\instances\test-1'
+```
+
+```bash
+# Linux / servidor
+./scripts/install-tht.sh /ruta/a/la/instancia
+```
+
+Ambos aceptan un jar local como segundo parámetro si preferís bajarlo desde Actions.
+
 ### En tu máquina
 
 Requiere **JDK 17**:
