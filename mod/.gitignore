@@ -1,0 +1,12 @@
+# Gradle / MCreator build output
+/.gradle
+/build
+/bin
+/run
+/logs
+/.idea
+/.eclipse
+*.iml
+# local backups
+backup_v*/
+*.bak-v*

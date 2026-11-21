@@ -1,0 +1,92 @@
+plugins {
+    id 'eclipse'
+    id 'net.neoforged.moddev.legacyforge' version '2.0.116'
+}
+
+// 构建时间戳，格式 yyyyMMddHHmmss，拼进文件名
+def buildTimestamp = new java.text.SimpleDateFormat("yyyyMMddHHmmss").format(new Date())
+version = "180.1-${buildTimestamp}" // [LMax Fix] 版本号修正: 前作者遗留默认1.0, 实际发布版本1.8.0(曾靠手动改jar文件名)
+base.archivesName = "tanshugetrees"
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+legacyForge {
+    version = "1.20.1-47.4.10"
+
+    runs {
+        client {
+            client()
+
+            def mcreatorJvmOptions = System.getenv('MCREATOR_JVM_OPTIONS')
+            if (mcreatorJvmOptions) {
+                mcreatorJvmOptions.split("\\s+").findAll { it.trim() }.each { arg ->
+                    jvmArgument(arg)
+                }
+            }
+        }
+        server {
+            server()
+        }
+
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+    }
+
+    mods {
+        mcreator {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+// [LMax Fix 刀U2b A3] [长期记忆: 174] 模板lint: ConfigClassic.repair把任何含" = "的行当配置项(不排除"|"注释行),
+// 注释行误写" = "会产生幽灵option -> options/defaults位置错位 -> IndexOOB(判例: 2026-09-24 crash 01:59/03:27两连崩).
+// 编译前扫描全部源码, 命中即拒build: 把事后取证变成事前拦截.
+tasks.register('lintConfigTemplates') {
+    group = 'verification'
+    description = 'Reject "|" comment lines containing " = " (ConfigClassic ghost-option contract) [LMax A3]'
+    doLast {
+        def violations = []
+        fileTree('src/main/java').include('**/*.java').each { f ->
+            f.eachLine('UTF-8') { line, no ->
+                if (line.trim().startsWith('|') && line.contains(' = ')) {
+                    violations.add("${f.name}:${no}: " + line.trim().substring(0, Math.min(100, line.trim().length())))
+                }
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw new GradleException("[LMax lintConfigTemplates] ghost option line(s) found [long-term memory 174]:\n  " + violations.join("\n  "))
+        }
+    }
+}
+tasks.named('compileJava') { dependsOn 'lintConfigTemplates' }
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+mixin {
+    if (file("src/main/resources/tanshugetrees.mixins.json").exists()) {
+        add sourceSets.main, "tanshugetrees.refmap.json"
+        config "tanshugetrees.mixins.json"
+    }
+}
+
+dependencies {
+    // [U5] night-config: Forge 运行时类路径自带(mods.toml 同源家族), 编译侧自供 jar(compileOnly 不打包), libs/ 为源
+    compileOnly files('libs/night-config-core-3.6.4.jar', 'libs/night-config-toml-3.6.4.jar')
+    compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:0.5.0"))
+    implementation(jarJar("io.github.llamalad7:mixinextras-forge:0.5.0"))
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+}
+
+jar {
+    if (file("src/main/resources/tanshugetrees.mixins.json").exists()) {
+        manifest.attributes([
+                "MixinConfigs": "tanshugetrees.mixins.json"
+        ])
+    }
+}
+
+apply from: 'mcreator.gradle'

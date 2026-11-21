@@ -1,0 +1,633 @@
+package tannyjung.tanshugetrees_core.outside;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.*;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+
+public class FileManager {
+
+	public static void createEmptyFile (String path, boolean is_directory) {
+
+        File file = new File(path);
+
+		if (file.exists() == false) {
+
+            try {
+
+                if (is_directory == true) {
+
+                    file.mkdirs();
+
+                } else {
+
+                    file.getParentFile().mkdirs();
+                    file.createNewFile();
+
+                }
+
+            } catch (Exception exception) {
+
+                OutsideUtils.exception(new Exception(), exception, "");
+
+            }
+
+		}
+
+	}
+
+    public static List<File> getAllFiles (String path) {
+
+        List<File> files = new ArrayList<>();
+
+        try {
+
+            Files.walk(Path.of(path)).forEach(source -> {
+
+                if (source.toFile().isDirectory() == false) {
+
+                    files.add(source.toFile());
+
+                }
+
+            });
+
+        } catch (Exception exception) {
+
+            OutsideUtils.exception(new Exception(), exception, "");
+
+        }
+
+        return files;
+
+    }
+
+    public static void rename (String path, String new_name) {
+
+        File file = new File(path);
+        file.renameTo(new File(file.getParentFile().getPath() + "/" + new_name));
+
+    }
+
+    public static void copy (String from, String to, boolean is_directory) {
+
+        Path path_from = Path.of(from);
+        Path path_to = Path.of(to);
+
+        if (is_directory == false) {
+
+            createEmptyFile(path_to.getParent().toString(), true);
+
+            try {
+
+                Files.copy(path_from, path_to, StandardCopyOption.REPLACE_EXISTING);
+
+            } catch (Exception exception) {
+
+                OutsideUtils.exception(new Exception(), exception, "");
+
+            }
+
+        } else {
+
+            try {
+
+                Files.walk(path_from).forEach(source -> {
+
+                    if (source.toFile().isDirectory() == false) {
+
+                        Path path_new = path_to.resolve(path_from.relativize(source));
+                        createEmptyFile(path_new.getParent().toString(), true);
+
+                        try {
+
+                            Files.copy(source, path_new, StandardCopyOption.REPLACE_EXISTING);
+
+                        } catch (Exception exception) {
+
+                            OutsideUtils.exception(new Exception(), exception, "");
+
+                        }
+
+                    }
+
+                });
+
+            } catch (Exception exception) {
+
+                OutsideUtils.exception(new Exception(), exception, "");
+
+            }
+        }
+
+    }
+
+    public static void delete (String path) {
+
+        File file = new File(path);
+
+        if (file.exists() == true) {
+
+            try {
+
+                Files.walk(file.toPath()).sorted(Comparator.reverseOrder()).forEach(source -> {
+
+                    source.toFile().delete();
+
+                });
+
+            } catch (Exception exception) {
+
+                OutsideUtils.exception(new Exception(), exception, "");
+
+            }
+        }
+
+    }
+
+	public static void writeTXT (String path, String write, boolean append) {
+
+	        // 修复: 增加 null 检查，防止传入 null 路径导致游戏崩溃
+	        if (path == null) {
+	            return;
+	        }
+
+	        File file = new File(path);
+        createEmptyFile(file.getPath(), false);
+
+		try {
+
+			Writer writer = new OutputStreamWriter(new FileOutputStream(file, append), StandardCharsets.UTF_8); // [U4] FileWriter用平台默认字符集(中文Win=GBK), 与readTXT的UTF-8不对称=中文config乱码根因
+			BufferedWriter buffered_writer = new BufferedWriter(writer);
+
+			buffered_writer.write(write);
+
+			buffered_writer.close();
+			writer.close();
+
+		} catch (Exception exception) {
+
+			OutsideUtils.exception(new Exception(), exception, "");
+
+		}
+
+	}
+
+	public static String[] readTXT (String path) {
+
+	        // 修复: 增加 null 检查，防止传入 null 路径导致游戏崩溃
+	        if (path == null) {
+	            return new String[0];
+	        }
+
+	        File file = new File(path);
+
+		if (file.exists() == true) {
+
+			try {
+
+				List<String> lines_u4 = Files.readAllLines(file.toPath(), StandardCharsets.UTF_8); // [U4] 显式UTF-8: 契约锁死不随平台漂移
+				// [U4] BOM归一: 剥首行U+FEFF(用户编辑器可能写入BOM), 防键名/首值被污染
+				if (lines_u4.isEmpty() == false && lines_u4.get(0).startsWith(String.valueOf((char) 0xFEFF)) == true) {
+				    lines_u4.set(0, lines_u4.get(0).substring(1));
+				}
+				return lines_u4.toArray(new String[0]);
+
+			} catch (Exception exception) {
+
+				OutsideUtils.exception(new Exception(), exception, "");
+
+			}
+
+		}
+
+		return new String[0];
+
+	}
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, Object> file_locks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static void writeBIN (String path, List<String> write, boolean append) {
+
+        createEmptyFile(path, false);
+
+        if (write.size() > 0) {
+            Object lock = file_locks.computeIfAbsent(path, k -> new Object());
+            synchronized (lock) {
+                try {
+
+                    DataOutputStream file_bin = new DataOutputStream(new FileOutputStream(path, append));
+
+                    {
+
+                        String type = "";
+                        String value = "";
+
+                        for (String scan : write) {
+
+                            type = scan.substring(0, 1);
+                            value = scan.substring(1);
+
+                            if (type.equals("b") == true) {
+
+                                file_bin.writeByte(Byte.parseByte(value));
+
+                            } else if (type.equals("s") == true) {
+
+                                file_bin.writeShort(Short.parseShort(value));
+
+                            } else if (type.equals("i") == true) {
+
+                                file_bin.writeInt(Integer.parseInt(value));
+
+                            } else if (type.equals("l") == true) {
+
+                                file_bin.writeBoolean(Boolean.parseBoolean(value));
+
+                            }
+
+                        }
+
+                    }
+
+                    file_bin.close();
+
+                } catch (Exception exception) {
+
+                    OutsideUtils.exception(new Exception(), exception, "");
+
+                }
+                // [LMax Fix V41] 写后失效同路径 BIN_CACHE [长期记忆: 012]
+                // 根因：place/*.bin 为 append 式增量落盘，readBIN 可能在两次写入之间读入旧版本
+                // 并被 LRU 缓存持有（容量 512，本会话仅 ~20 文件，永不淘汰），后续追加数据对读方永久不可见。
+                // 写完成后移除缓存条目（含异常路径——半写文件同样必须失效），强制下次 readBIN 直读磁盘。
+                BIN_CACHE.remove(path);
+            }
+        }
+
+    }
+
+    // [LMax Fix V19] .bin 文件内存缓存，解决同步 I/O 导致的 CPU 空转和生成缓慢
+    private static final Map<String, byte[]> BIN_CACHE = java.util.Collections.synchronizedMap(
+        new java.util.LinkedHashMap<String, byte[]>(256, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
+                return size() > 512; // 最多缓存 512 个 .bin 文件
+            }
+        }
+    );
+
+    public static ByteBuffer readBIN (String path) {
+        // 优先从内存缓存读取
+        byte[] cached = BIN_CACHE.get(path);
+        if (cached != null) {
+            return ByteBuffer.wrap(cached).asReadOnlyBuffer().order(ByteOrder.BIG_ENDIAN);
+        }
+
+        File file = new File(path);
+
+        if (file.exists() == true) {
+
+            try {
+                byte[] bytes = Files.readAllBytes(file.toPath());
+                BIN_CACHE.put(path, bytes); // 存入缓存
+                return ByteBuffer.wrap(bytes).asReadOnlyBuffer().order(ByteOrder.BIG_ENDIAN);
+
+            } catch (Exception exception) {
+
+                OutsideUtils.exception(new Exception(), exception, "");
+
+            }
+
+        }
+
+        return ByteBuffer.allocate(0);
+
+    }
+
+    public static void extractZIP (String path_zip, String path_folder, boolean skip_first_folder, String filter) {
+
+        createEmptyFile(path_folder, true);
+
+        try {
+
+            ZipInputStream stream_input = new ZipInputStream(new FileInputStream(path_zip));
+            ZipEntry entry = stream_input.getNextEntry();
+            FileOutputStream stream_output = null;
+            byte[] bytes = new byte[1024];
+            int length = 0;
+            String entry_path = "";
+            int first_folder = 0;
+
+            while (entry != null) {
+
+                if (skip_first_folder == true) {
+
+                    if (first_folder == 0) {
+
+                        first_folder = entry.getName().length();
+
+                    }
+
+                }
+
+                entry_path = entry.getName().substring(first_folder);
+                // [MODS-CONFIG][issue #12] Windows 打的 ZIP 用 '\' 当分隔符, 解到 Linux 会把整串
+                // 当成一个文件名 (没有子目录) -> dev/temporary 里找不到任何 preset -> 零树/无草方块.
+                // 统一成 '/' 再落盘, 兼容两个平台.
+                entry_path = entry_path.replace('\\', '/');
+
+                if (entry_path.contains(filter) == true) {
+
+                    // [MODS-CONFIG][issue #12] 归一后以 '/' 结尾即目录 (反斜杠 ZIP 的 isDirectory() 可能为 false)
+                    if (entry.isDirectory() == true || entry_path.endsWith("/") == true) {
+
+                        createEmptyFile(path_folder + "/" + entry_path, true);
+
+                    } else {
+
+                        createEmptyFile(path_folder + "/" + entry_path, false);
+                        stream_output = new FileOutputStream(path_folder + "/" + entry_path);
+
+                        while ((length = stream_input.read(bytes)) > 0) {
+
+                            stream_output.write(bytes, 0, length);
+
+                        }
+
+                        stream_output.close();
+
+                    }
+
+                }
+
+                entry = stream_input.getNextEntry();
+
+            }
+
+            stream_input.closeEntry();
+            stream_input.close();
+
+        } catch (Exception exception) {
+
+            OutsideUtils.exception(new Exception(), exception, "");
+
+        }
+
+    }
+
+    public static void compressZIP (String path_zip, File file) {
+
+        createEmptyFile(path_zip, false);
+
+        try {
+
+            ZipOutputStream stream_output = new ZipOutputStream(new FileOutputStream(path_zip));
+            byte[] bytes = new byte[1024];
+
+            if (file.isDirectory() == false) {
+
+                FileInputStream stream_input = new FileInputStream(file);
+                stream_output.putNextEntry(new ZipEntry(file.getName()));
+                int length = 0;
+
+                while ((length = stream_input.read(bytes)) >= 0) {
+
+                    stream_output.write(bytes, 0, length);
+
+                }
+
+                stream_input.close();
+
+            } else {
+
+                Files.walk(file.toPath()).forEach(source -> {
+
+                    if (source.toFile().isDirectory() == false) {
+
+                        try {
+
+                            FileInputStream stream_input = new FileInputStream(source.toFile());
+                            stream_output.putNextEntry(new ZipEntry(file.toPath().relativize(source).toString()));
+                            int length = 0;
+
+                            while ((length = stream_input.read(bytes)) >= 0) {
+
+                                stream_output.write(bytes, 0, length);
+
+                            }
+
+                            stream_input.close();
+
+                        } catch (Exception exception) {
+
+                            OutsideUtils.exception(new Exception(), exception, "");
+
+                        }
+
+                    }
+
+                });
+
+            }
+
+            stream_output.close();
+
+        } catch (Exception exception) {
+
+            OutsideUtils.exception(new Exception(), exception, "");
+
+        }
+
+    }
+
+    public static void mergeTXT (File file_from, File file_to) {
+
+        if (file_to.exists() == false) {
+
+            copy(file_from.getPath(), file_to.getPath(), false);
+
+        } else {
+
+            String[] data_new = FileManager.readTXT(file_from.getPath());
+
+            if (data_new[0].equals("# REPLACE") == true) {
+
+                StringBuilder write = new StringBuilder();
+                boolean skip = true;
+
+                for (String scan : data_new) {
+
+                    if (skip == true) {
+
+                        skip = false;
+                        continue;
+
+                    }
+
+                    write.append(scan).append("\n");
+
+                }
+
+                FileManager.writeTXT(file_to.getPath(), write.toString(), false);
+
+            } else {
+
+                String[] data_old = FileManager.readTXT(file_to.getPath());
+                Map<String, String> data = new HashMap<>();
+                String[] split = null;
+                String[] split2 = null;
+
+                // Get Old Data
+                {
+
+                    for (String scan : data_old) {
+
+                        if (scan.isEmpty() == false) {
+
+                            if (scan.startsWith("#") == false) {
+
+                                if (scan.contains(" = ") == true) {
+
+                                    split = scan.split(" = ");
+                                    data.put(split[0], split[1]);
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+                List<String> write_add = new ArrayList<>();
+
+                // Get Data
+                {
+
+                    StringBuilder merge = new StringBuilder();
+
+                    for (String scan : data_new) {
+
+                        if (scan.isEmpty() == false) {
+
+                            if (scan.contains(" = ") == true) {
+
+                                if (scan.startsWith("# MERGE") == true) {
+
+                                    {
+
+                                        split = scan.substring(scan.indexOf(" -> ") + 4).split(" = ");
+
+                                        if (data.containsKey(split[0]) == false) {
+
+                                            write_add.add(split[0] + " = " + split[1]);
+
+                                        } else {
+
+                                            merge.setLength(0);
+                                            merge.append("|").append(data.get(split[0]).replace(" / ", "| / |")).append("|");
+
+                                            for (String scan_list : split[1].split(" / ")) {
+
+                                                if (merge.toString().contains("|" + scan_list + "|") == false) {
+
+                                                    merge.append(" / ").append(scan_list);
+
+                                                }
+
+                                            }
+
+                                            data.put(split[0], merge.toString().replace("|", ""));
+
+                                        }
+
+                                    }
+
+                                } else if (scan.startsWith("# REPLACE") == true) {
+
+                                    {
+
+                                        split = scan.substring(scan.indexOf(" -> ") + 4).split(" = ");
+
+                                        if (data.containsKey(split[0]) == true) {
+
+                                            split2 = data.get(split[1]).split(" >>> ");
+                                            write_add.add(split[0] + " = " + data.get(split[0]).replace(split2[0], split2[1]));
+
+                                        }
+
+                                    }
+
+
+                                } else {
+
+                                    split = scan.split(" = ");
+
+                                    if (data.containsKey(split[0]) == true) {
+
+                                        data.replace(split[0], split[1]);
+
+                                    } else {
+
+                                        write_add.add(scan);
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+                // Write
+                {
+
+                    List<String> write = new ArrayList<>();
+
+                    for (String scan : data_old) {
+
+                        if (scan.contains(" = ") == false) {
+
+                            write.add(scan);
+
+                        } else {
+
+                            if (scan.startsWith("# MERGE") == true) {
+
+                                scan = scan.substring(scan.indexOf(" -> ") + 4);
+
+                            }
+
+                            split = scan.split(" = ");
+                            write.add(split[0] + " = " + data.get(split[0]));
+
+                        }
+
+                    }
+
+                    write.addAll(write_add);
+                    FileManager.writeTXT(file_to.getPath(), String.join("\n", write), false);
+
+                }
+
+            }
+
+        }
+
+    }
+
+}
