@@ -139,12 +139,18 @@ Workflow: `.github/workflows/build.yml` (Actions → **Build mod jar** → *Run 
 
 1. Entrá a la pestaña **Actions** del repo → `Build mod jar` → **Run workflow** (podés cambiar el sufijo
    del nombre del jar, por defecto `configmods`).
-2. Cuando termina (~5-10 min), el jar queda en **Artifacts → `tanshugetrees-jar`**:
-   `TansHugeTrees-1.8.0-Forge-1.20.1-configmods.jar`.
+2. Cuando termina (~5 min), el jar queda en **Artifacts → `tanshugetrees-jar`**:
+   `TansHugeTrees-1.8.0-Forge-1.20.1-configmods.jar` (~64,4 MB).
 3. Alternativa: creá un tag (`git tag v1.1 && git push origin v1.1`) y el workflow adjunta el jar a una
    **release en borrador** automáticamente, lista para publicar.
 
-El workflow usa JDK 17 (Temurin), cachea Gradle y compila con `./gradlew build`.
+El workflow usa JDK 17 (Temurin), cachea Gradle, compila con `./gradlew build` y **verifica el jar**
+antes de subirlo: que exista `LogLimiter.class`, que las claves `world_gen_dimensions` y
+`sapling_auto_grow_chance` estén en `Handcode$Config`, y que el pack `#main.zip` siga embebido (sin él el
+mod no genera árboles). Si algo falta, el job falla en vez de publicar un build incompleto.
+
+> Estado: el build de esta rama ya corrió en GitHub Actions y terminó en verde
+> (artifact `tanshugetrees-jar`, 64.382.741 bytes).
 
 ### En tu máquina
 
