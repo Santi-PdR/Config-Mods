@@ -1,0 +1,155 @@
+name: Build mod jar
+
+# Compila TansHugeTrees 1.20.1 (Forge 47.4.10) y publica el jar:
+#   - siempre como artefacto de Actions (requiere estar logueado en GitHub)
+#   - al crear un tag v*: además como asset de una release PÚBLICA, descargable con
+#     Invoke-WebRequest/curl sin login (URL estable), y con .sha256 + info de tamaño.
+# Se puede lanzar a mano (Actions -> Build mod jar -> Run workflow).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: "Sufijo opcional para el nombre del jar (ej: configmods)"
+        required: false
+        default: "configmods"
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "mod/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write   # necesario para crear la release y subir el asset al pushear un tag
+
+jobs:
+  build:
+    name: Gradle build (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # El repo no incluye gradle-wrapper.jar en todas las ramas: si falta, se genera con la versión del proyecto.
+      - name: Ensure Gradle wrapper
+        run: |
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            GRADLE_VERSION="$(sed -n 's#.*gradle-\(.*\)-bin.zip#\1#p' gradle/wrapper/gradle-wrapper.properties | head -1)"
+            echo "Generando wrapper para Gradle ${GRADLE_VERSION}"
+            curl -sSLo /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+            unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
+            /tmp/gradle-dist/gradle-${GRADLE_VERSION}/bin/gradle wrapper --gradle-version "${GRADLE_VERSION}" --distribution-type bin
+          fi
+          chmod +x gradlew
+
+      - name: Configure Gradle caches
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('mod/gradle/wrapper/gradle-wrapper.properties', 'mod/build.gradle') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build
+        run: ./gradlew build --stacktrace --no-daemon
+        env:
+          # Menos presión de memoria en runners de 7 GB (MCreator/Forge tiran mucho)
+          GRADLE_OPTS: "-Xmx4G"
+
+      - name: Show produced jars
+        run: ls -la build/libs
+
+      - name: Rename jar
+        id: jar
+        run: |
+          SUFFIX="${{ github.event.inputs.version_suffix }}"
+          if [ -z "$SUFFIX" ]; then SUFFIX="configmods"; fi
+          SRC="$(ls build/libs/*.jar | grep -v -- '-sources' | grep -v -- '-dev' | head -1)"
+          OUT="TansHugeTrees-1.8.0-Forge-1.20.1-${SUFFIX}.jar"
+          cp "$SRC" "$OUT"
+          echo "path=${OUT}" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+          sha256sum "$OUT"
+
+      # Verifica que el jar realmente contiene los fixes (evita publicar un build sin los cambios)
+      - name: Verify patched classes
+        run: |
+          JAR="build/libs/$(ls build/libs | grep -v -- '-sources' | grep -v -- '-dev' | head -1)"
+          echo "Inspeccionando $JAR"
+          unzip -p "$JAR" tannyjung/tanshugetrees_core/outside/LogLimiter.class > /dev/null \
+            && echo "OK: LogLimiter.class presente" \
+            || { echo "FALTA LogLimiter.class"; exit 1; }
+          unzip -p "$JAR" tannyjung/tanshugetrees_handcode/Handcode\$Config.class > /tmp/handcode.class
+          strings /tmp/handcode.class | grep -q "world_gen_dimensions" \
+            && echo "OK: clave world_gen_dimensions presente" \
+            || { echo "FALTA world_gen_dimensions"; exit 1; }
+          strings /tmp/handcode.class | grep -q "sapling_auto_grow_chance" \
+            && echo "OK: clave sapling_auto_grow_chance presente" \
+            || { echo "FALTA sapling_auto_grow_chance"; exit 1; }
+          unzip -l "$JAR" | grep -q "#main.zip" \
+            && echo "OK: pack #main.zip embebido" \
+            || { echo "FALTA el pack #main.zip (el mod no generaria arboles)"; exit 1; }
+
+      # Checksum + metadata: se publican junto al jar para que el script de descarga pueda verificar
+      - name: Write checksum and metadata
+        id: meta
+        run: |
+          OUT="${{ steps.jar.outputs.path }}"
+          SHA="$(sha256sum "$OUT" | cut -d' ' -f1)"
+          SIZE="$(stat -c%s "$OUT")"
+          printf '%s  %s\n' "$SHA" "$OUT" > "${OUT}.sha256"
+          printf 'file=%s\nsha256=%s\nsize=%s\n' "$OUT" "$SHA" "$SIZE" > "jar-info.txt"
+          cat jar-info.txt
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanshugetrees-jar
+          path: |
+            mod/${{ steps.jar.outputs.path }}
+            mod/${{ steps.jar.outputs.path }}.sha256
+            mod/jar-info.txt
+          if-no-files-found: error
+
+      # Release pública (no draft) para poder descargar el jar con Invoke-WebRequest sin login.
+      # URL resultante:
+      #   https://github.com/Santi-PdR/Config-Mods/releases/download/<tag>/TansHugeTrees-1.8.0-Forge-1.20.1-configmods.jar
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mod/${{ steps.jar.outputs.path }}
+            mod/${{ steps.jar.outputs.path }}.sha256
+            mod/jar-info.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            Build automático de **Tan's Huge Trees 1.20.1 (Forge 47.4.10)** con los fixes de este repositorio.
+
+            - Filtro de dimensiones por servidor: `world_gen_dimensions` / `world_gen_dimensions_mode` en
+              `config/tanshugetrees/config.toml` (comodines: `twilightforest-*`, `*-the_aether`, `minecraft-*`, `*`).
+            - Saplings que no crecían (NBT sobrescrito + ruta de preset) y `sapling_auto_grow_chance`.
+            - Consola sin spam (`LogLimiter`), ZIP con `\` normalizado.
+
+            SHA-256 y tamaño en `jar-info.txt` / `<jar>.sha256`.
+
+            Créditos: mod original de **TannyJung**; base de mantenimiento **LMaxRouterCN**. Publicado con permiso del autor.

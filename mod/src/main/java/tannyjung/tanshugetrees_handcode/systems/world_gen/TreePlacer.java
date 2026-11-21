@@ -1,0 +1,2505 @@
+        
+
+          
+package tannyjung.tanshugetrees_handcode.systems.world_gen;
+
+import it.unimi.dsi.fastutil.longs.LongSet;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.Mth;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.levelgen.GenerationStep;
+import net.minecraft.world.level.levelgen.structure.Structure;
+import tannyjung.tanshugetrees_core.Core;
+import tannyjung.tanshugetrees_core.outside.*;
+import tannyjung.tanshugetrees_core.game.GameUtils;
+import tannyjung.tanshugetrees_handcode.Handcode;
+import tannyjung.tanshugetrees_handcode.systems.Caches;
+import tannyjung.tanshugetrees_handcode.systems.living_mechanics.LeafLitter;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+public class TreePlacer {
+
+    // [LMax Fix V5] 工业级延迟补种队列 V2：引入区块就绪检查与重试机制
+    public static class DeferredQueue {
+        private static class DeferredTask {
+            String dimension;
+            // [LMax Fix V40] 维度运行时本体：入队方直接提供 ResourceKey<Level>，消费侧零字符串解析 [长期记忆: 010]
+            // 横杠化 dimension 字段保留，仅供 Data 文件路径序列化使用
+            net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dim_key;
+            ChunkPos chunk_pos;
+            int retries;
+            // [方向A重构] 新增：目标 chunk 和是否强制补写标记
+            ChunkPos target_chunk; // 用于 PendingBlocks 补写，null 表示重新调 start
+            boolean is_forced;     // true 表示只补写 PendingBlocks，不重新调 start
+            
+            // 旧版构造函数（重新调 start）
+            DeferredTask(String d, net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dk, ChunkPos c) { // [LMax Fix V40] 新增dk [长期记忆: 010]
+                this.dimension = d;
+                this.dim_key = dk;
+                this.chunk_pos = c;
+                this.retries = 0;
+                this.target_chunk = null;
+                this.is_forced = false;
+            }
+            
+            // [方向A重构] 新增构造函数（PendingBlocks 补写）
+            DeferredTask(String d, net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dk, ChunkPos c, ChunkPos target, boolean forced) { // [LMax Fix V40] 新增dk [长期记忆: 010]
+                this.dimension = d;
+                this.dim_key = dk;
+                this.chunk_pos = c;
+                this.retries = 0;
+                this.target_chunk = target;
+                this.is_forced = forced;
+            }
+        }
+
+        private static final java.util.concurrent.ConcurrentLinkedQueue<DeferredTask> queue = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        // [LMax Fix V54 刀S] [长期记忆: 149] O(1) 队列深度计数器(q 变量+仪表): ConcurrentLinkedQueue.size() 是 O(n) 遍历,
+        // AtomicInteger 全出口维护: 树线程 add/addForced increment, 主线程 poll decrement, evict 条件 decrement,
+        // retryList 回流 addAndGet. 漂移防护: 出口闭环 + 仪表侧 counter vs size() 双报(见 processTick, 键开才付 O(n)).
+        private static final java.util.concurrent.atomic.AtomicInteger depth = new java.util.concurrent.atomic.AtomicInteger();
+
+        public static void add(String dimension, net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dim_key, ChunkPos chunk_pos) { // [LMax Fix V40] 新增dim_key [长期记忆: 010]
+            // [MODS-CONFIG] 被排除的维度不入队 (队列与深度计数器保持干净)
+            if (tannyjung.tanshugetrees_handcode.Handcode.Config.isDimensionAllowed(dimension) == false) {
+                return;
+            }
+            // [LMax Fix V7] 容量上限检查，防止无界队列导致 OOM
+            // [LMax Fix V42] 溢出驱逐升级见 evictOldest：旧实现无条件 poll 队头，把跨 chunk 树的 forced
+            // 方块载荷与空数据 churn 任务一起混杀（世界22 随机空白区域根因之一，实测 184393 次溢出驱逐）
+            // [LMax Fix V53 刀R] [长期记忆: 142] 有界守卫: max_size=0(新默认)=无界(短路恒false, 驱逐不触发); >0=有界玩家选项才驱逐。
+            // 陷阱防: 旧式 while(queue.size()>=max) 在 max=0 时恒真 -> add线程无限evictOldest -> 队列被清空+线程挂死。
+            while (Handcode.Config.deferred_queue_max_size > 0 && queue.size() >= Handcode.Config.deferred_queue_max_size) {
+                evictOldest();
+            }
+            queue.add(new DeferredTask(dimension, dim_key, chunk_pos)); // [LMax Fix V40]
+            depth.incrementAndGet(); // [LMax Fix V54 刀S] O(1) 深度计数
+        }
+
+        // [方向A重构] 新增：PendingBlocks 补写任务
+        public static void addForced(String dimension, net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dim_key, ChunkPos chunk_pos, ChunkPos target_chunk) { // [LMax Fix V40] 新增dim_key [长期记忆: 010]
+            // [MODS-CONFIG] 被排除的维度不入队
+            if (tannyjung.tanshugetrees_handcode.Handcode.Config.isDimensionAllowed(dimension) == false) {
+                return;
+            }
+            // [LMax Fix V53 刀R] [长期记忆: 142] 有界守卫: max_size=0(新默认)=无界(短路恒false, 驱逐不触发); >0=有界玩家选项才驱逐。
+            // 陷阱防: 旧式 while(queue.size()>=max) 在 max=0 时恒真 -> add线程无限evictOldest -> 队列被清空+线程挂死。
+            while (Handcode.Config.deferred_queue_max_size > 0 && queue.size() >= Handcode.Config.deferred_queue_max_size) {
+                evictOldest();
+            }
+            queue.add(new DeferredTask(dimension, dim_key, chunk_pos, target_chunk, true)); // [LMax Fix V40]
+            depth.incrementAndGet(); // [LMax Fix V54 刀S] O(1) 深度计数
+        }
+
+        // [LMax Fix V53 刀R] [长期记忆: 142] 语义变更: max_size=0(新默认)=无界, 本方法不再被触发(调用方短路守卫);
+        // >0=有界玩家选项。设计立场: 丢树 >> 吃内存; 队列深度增长=跑图过快的自然背压信号(非泄漏), 提示玩家减速。
+        // [LMax Fix V42] 溢出驱逐：优先丢最老的非 forced 任务，队列全是 forced 时才丢绝对队头。
+        // forced 任务是跨 chunk 树的方块载荷，丢一个 = 一块区域永远缺树；非 forced 只是重跑 start 的重试，
+        // 丢了会被 TreeLocation 的 region 完成事件唤醒机制补回。
+        // ConcurrentLinkedQueue 迭代弱一致：只读定位 + remove(对象) 原子删除，与并发 poll/add 安全共存
+        // （remove 失败 = 该任务恰好被别的线程消费，外层 while 重查 size 即可）。
+        private static void evictOldest () {
+            DeferredTask oldest = null;
+            for (DeferredTask t : queue) {
+                if (t.is_forced == true) continue;
+                oldest = t;
+                break;
+            }
+            if (oldest != null) {
+                if (queue.remove(oldest)) {
+                    depth.decrementAndGet(); // [LMax Fix V54 刀S] remove 失败=任务已被并发消费, 计数归消费方
+                }
+            } else {
+                oldest = queue.poll(); // 兜底：队列全 forced，只能丢绝对队头
+                if (oldest != null) {
+                    depth.decrementAndGet(); // [LMax Fix V54 刀S] O(1) 深度计数
+                }
+            }
+            if (oldest != null) {
+                // [LMax Fix V42] 溢出告警改走 log_queue_overflow 键控（旧 stderr 不受任何开关控制）
+                if (Core.log_queue_overflow) System.err.println("[TansHugeTrees] DeferredQueue overflow, dropped task: " + oldest.dimension + " " + oldest.chunk_pos + " forced=" + oldest.is_forced);
+            }
+        }
+
+        public static void processTick(net.minecraft.server.MinecraftServer server) {
+            int processed = 0;
+            DeferredTask task;
+            java.util.List<DeferredTask> retryList = new java.util.ArrayList<>();
+
+            // [LMax Fix V46] 时间片滴灌 [长期记忆: 018]: 主线程消费改 nanoTime 预算制(默认40, 配置 deferred_queue_budget_ms).
+            // V43c 铁律: 主线程防卡须用时间片(恒定开销)而非任务数预算(量不可控: 单任务=整树生成+整chunk落块,
+            // 重量无上界, 计数闸形同虚设). budget<=0=暂停消费(任务滞留队列). 计数上限保留为第二道保险.
+            // 已知敞口: 预算检查在任务粒度, 单任务超支=该树自身生成成本(任务原子不切分; 切分=V44游标架构已废).
+            // [LMax Fix V54 刀S] [长期记忆: 149] 预算求值: static 直读 / expr 每 tick 边界一次求值(tick 内恒定),
+            // 求值非有限(NaN/Inf)或表达式未武装 → 回退 static 值. 语义兼容: 预算<=0 = 暂停消费(钳制权在表达式作者).
+            long drainStartNano = System.nanoTime(); // d 测量: 本 tick 滴灌实耗(供下一 tick 表达式变量)
+            long budgetMs = resolveBudgetMs();
+            long budgetDeadline = System.nanoTime() + budgetMs * 1_000_000L;
+            while (System.nanoTime() < budgetDeadline
+                    && processed < Handcode.Config.deferred_queue_process_per_tick
+                    && (task = queue.poll()) != null) {
+                processed++;
+                depth.decrementAndGet(); // [LMax Fix V54 刀S] poll 成功计数(主线程消费点)
+                try {
+                    // [LMax Fix V40] 修复维度串黑洞：任务现携带 ResourceKey<Level>（入队方取 level.dimension()），
+                    // 不再从横杠化文件路径串（如 "minecraft-overworld"）反解析——parse 对无冒号串补默认命名空间，
+                    // 得到不存在的 "minecraft:minecraft-overworld" → getLevel()=null → 旧代码静默 continue 吞掉全部任务 [长期记忆: 010]
+                    ServerLevel targetLevel = server.getLevel(task.dim_key);
+
+                    if (targetLevel == null) {
+                        // [LMax Fix V40] 黑洞封口：维度查找失败必须可见，不再静默丢弃
+                        // [LMax Fix V53 刀R预备] 补键控守卫: dropped-task裸err, 与同方法FORCED/NORMAL DROPPED同域走log_deferred_queue
+                        if (Core.log_deferred_queue) System.err.println("[TansHugeTrees] DeferredQueue dropped task: level not found for dim_key=" + task.dim_key + " chunk=" + task.chunk_pos + " forced=" + task.is_forced);
+                        continue;
+                    }
+
+                    // [方向A重构] 区分两种任务：重新调 start vs 只补写 PendingBlocks
+                    if (task.is_forced) {
+                        // PendingBlocks 补写任务
+                        // [LMax Debug V40] forced 任务诊断日志 [长期记忆: 009]
+                        if (Core.log_deferred_queue) System.out.println("[THT-DEBUG] processTick FORCED task: source=" + task.chunk_pos + " target=" + task.target_chunk + " retries=" + task.retries);
+                        // [LMax Fix V49 刀A] [长期记忆: 086] 主线程大冻结根治：旧路 hasChunk 过 → targetLevel.getChunk(cx,cz)
+                        // = getChunk(FULL,load=true)，主线程同步 join 区块管线（V47/V48 大冻结 125s 常数项的源）。
+                        // 新路 getChunkNow 纯读探测（只查已加载 map，不调度不等待）：null=未就绪（语义=旧 hasChunk=false），
+                        // 非 null 的 LevelChunk 必为 FULL（可见 map 只收 FULL），status 检查保留为防御。
+                        // 检查目标 chunk 是否就绪
+                        boolean allReady = true;
+                        String failReason = "";
+                        for (int dx = -4; dx <= 4; dx += 8) {
+                            for (int dz = -4; dz <= 4; dz += 8) {
+                                int cx = task.chunk_pos.x + dx;
+                                int cz = task.chunk_pos.z + dz;
+                                net.minecraft.world.level.chunk.LevelChunk readyChunk = targetLevel.getChunkSource().getChunkNow(cx, cz);
+                                if (readyChunk == null) {
+                                    allReady = false;
+                                    failReason = "getChunkNow=null at (" + cx + "," + cz + ")";
+                                    break;
+                                }
+                                if (!readyChunk.getHighestGeneratedStatus().isOrAfter(net.minecraft.world.level.chunk.ChunkStatus.FULL)) {
+                                    allReady = false;
+                                    failReason = "not FULL at (" + cx + "," + cz + ")";
+                                    break;
+                                }
+                            }
+                            if (!allReady) break;
+                        }
+
+                        if (!allReady) {
+                            // [LMax Debug V40] forced 检查失败原因
+                            if (Core.log_deferred_queue) System.out.println("[THT-DEBUG] processTick FORCED FAILED: " + failReason + " | source=" + task.chunk_pos + " target=" + task.target_chunk + " retries=" + task.retries);
+                            task.retries++;
+                            if (task.retries < Handcode.Config.deferred_queue_retry_limit) {
+                                retryList.add(task);
+                            } else {
+                                // [LMax Debug V40] forced 重试耗尽，任务被丢弃
+                                if (Core.log_deferred_queue) System.err.println("[THT-DEBUG] processTick FORCED DROPPED: source=" + task.chunk_pos + " target=" + task.target_chunk);
+                            }
+                        } else {
+                            // 区块已就绪，强制补写 PendingBlocks
+                            // [LMax Debug V40] forced 检查通过
+                            if (Core.log_deferred_queue) System.out.println("[THT-DEBUG] processTick FORCED PASSED: source=" + task.chunk_pos + " target=" + task.target_chunk);
+                            // [LMax Fix V50.4 刀N] 主线程落块原生发增量包（setBlock(2)），resyncChunk 退役后返回值无消费者
+                            PendingBlocks.placeForced(targetLevel, task.target_chunk);
+                            // [LMax Fix V55 刀T] FORCED 冲刷增落叶层：off-thread start 押后的 LeafLitter 缓存在此主线程消费
+                            // （LeafLitter.create 写入器未验证异步语义，Server 线程消费消风险；place 原子 take 后缓存空 =
+                            // 零操作幂等，与 Server-thread start 尾段原位消费的双消费方由 remove 原子性互斥）。
+                            LeafLitterGeneration.place(targetLevel, targetLevel, targetLevel.getChunkSource().getGenerator(), task.target_chunk);
+                        }
+                    } else {
+                        // 旧版逻辑：重新调 start
+                        // [LMax Debug V40] 非 forced 任务诊断日志 [长期记忆: 009]
+                        if (Core.log_deferred_queue) System.out.println("[THT-DEBUG] processTick NORMAL task: chunk=" + task.chunk_pos + " retries=" + task.retries);
+                        // 核心：检查当前 Chunk 及 +-4 偏移的 Chunk 是否全部达到 FULL 状态
+                        // [LMax Fix V49 刀A] [长期记忆: 086] 同 forced 分支根治：hasChunk+裸 getChunk 双检改 getChunkNow
+                        // 原子单检——裸 getChunk(cx,cz)=getChunk(FULL,load=true) 主线程同步 join 区块管线（V47/V48
+                        // 大冻结 125s 常数项直源）；getChunkNow 纯读只查已加载 map，null=未就绪（语义=旧 hasChunk=false）
+                        boolean allReady = true;
+                        String failReason = "";
+                        for (int dx = -4; dx <= 4; dx += 8) { // -4, +4
+                            for (int dz = -4; dz <= 4; dz += 8) {
+                                int cx = task.chunk_pos.x + dx;
+                                int cz = task.chunk_pos.z + dz;
+                                // [执行代号33] 检查区块生成状态是否达到 FULL，避免跨区块树木劈树问题
+                                net.minecraft.world.level.chunk.LevelChunk readyChunk = targetLevel.getChunkSource().getChunkNow(cx, cz);
+                                if (readyChunk == null) {
+                                    allReady = false;
+                                    failReason = "getChunkNow=null at (" + cx + "," + cz + ")";
+                                    break;
+                                }
+                                if (!readyChunk.getHighestGeneratedStatus().isOrAfter(net.minecraft.world.level.chunk.ChunkStatus.FULL)) {
+                                    allReady = false;
+                                    failReason = "not FULL at (" + cx + "," + cz + ")";
+                                    break;
+                                }
+                            }
+                            if (!allReady) break;
+                        }
+
+                        if (!allReady) {
+                            // [LMax Debug V40] 非 forced 检查失败原因
+                            if (Core.log_deferred_queue) System.out.println("[THT-DEBUG] processTick NORMAL FAILED: " + failReason + " | chunk=" + task.chunk_pos + " retries=" + task.retries);
+                            task.retries++;
+                            if (task.retries < Handcode.Config.deferred_queue_retry_limit) { // 最多重试 N Tick (配置项 deferred_queue_retry_limit)
+                                retryList.add(task);
+                            } else {
+                                // [LMax Debug V40] 非 forced 重试耗尽，任务被丢弃
+                                if (Core.log_deferred_queue) System.err.println("[THT-DEBUG] processTick NORMAL DROPPED: chunk=" + task.chunk_pos);
+                            }
+                        } else {
+                            // 区块已就绪，安全执行补种
+                            // [LMax Debug V40] 非 forced 检查通过
+                            if (Core.log_deferred_queue) System.out.println("[THT-DEBUG] processTick NORMAL PASSED: chunk=" + task.chunk_pos);
+                            ChunkGenerator gen = targetLevel.getChunkSource().getGenerator();
+                            // [LMax Fix V50.4 刀N] 主线程落块原生发增量包（start 内 setBlock(2)），resyncChunk 退役后返回值无消费者
+                            start(targetLevel, targetLevel, gen, task.dimension, task.chunk_pos);
+                        }
+                    }
+                } catch (Exception e) {
+                    LogLimiter.error("dq_task", "[TansHugeTrees] deferred placement task failed", e);
+                }
+            }
+            queue.addAll(retryList);
+            if (!retryList.isEmpty()) {
+                depth.addAndGet(retryList.size()); // [LMax Fix V54 刀S] 回流批量计数(这些任务离开过 poll 路径)
+            }
+
+            // [LMax Fix V54 刀S] d 记录 + 队列深度仪表: lastDrainMs 供下一 tick 表达式; 仪表=预算耗尽且队列仍有
+            // 剩余时键控打点, counter 与 size() 双报兼漂移探测(仅键开时付一次 O(n) 遍历, 生产静默零成本).
+            // 漂移只报告不自愈: depth.set(slow) 会与树线程 increment 并发丢计数, 报告留人工复核.
+            lastDrainMs = (System.nanoTime() - drainStartNano) / 1_000_000L;
+            if (Core.log_queue_depth && !queue.isEmpty()) {
+                int fast = depth.get();
+                int slow = queue.size();
+                if (fast != slow) {
+                    System.err.println("[THT] DQ depth gauge drift: counter=" + fast + " actual=" + slow);
+                }
+                System.out.println("[THT-DEBUG] DQ depth=" + slow + " (budget " + budgetMs + "ms exhausted, t=" +
+                        ((System.nanoTime() - tickStartNano) / 1_000_000L) + "ms d=" + lastDrainMs + "ms mode=" +
+                        Handcode.Config.deferred_queue_budget_mode + ")");
+            }
+        }
+
+        // [LMax Fix V54 刀S] [长期记忆: 149] 预算求值器 — V46 自适应钩子的兑现式(原 getBudgetMs 直读单值整体替换,
+        // V46 注释吸收于此; 消费循环结构零改动). 设计: 策略(表达式)推至用户数据层, 机制(求值/回退/换装)留代码层.
+        // 变量表: t=本 tick 前段耗时ms(EventCenter START 时戳→END 求值时刻, 滴灌自身未跑不含 d, 消除跨拍滞后主部)
+        //         d=上一 tick 滴灌实耗ms(辅助变量, 供用户写阻尼/观测式)
+        //         q=队列深度(O(1) 计数器)
+        // 求值时机: 每 tick 一次(边界), tick 内恒定; 编译仅在表达式源变更时发生(一次性 O(len)).
+        // 线程模型: compile 于 config 加载/热重载线程(synchronized 互斥), eval 于主线程; Program 不可变,
+        //           volatile 换装原子无锁; evalVars 主线程独占复用(eval 零分配).
+        // 回退链: 编译失败 → 保留旧 Program(warn-once); 求值非有限 → 该 tick 用 budget_ms(warn-once); 双保险不炸主循环.
+        private static final String[] BUDGET_VARS = {"t", "d", "q"};
+        private static volatile tannyjung.tanshugetrees_core.ExprEngine.Program budgetProgram = null;
+        private static volatile String budgetExprSource = null; // 当前已编译表达式原文(变更检测)
+        private static final Object compileLock = new Object();
+        private static long tickStartNano;   // EventCenter START 相位写入(主线程独占)
+        private static long lastDrainMs = 0; // d: processTick 末尾写入(主线程独占)
+        private static final double[] evalVars = new double[3];
+        private static final java.util.concurrent.atomic.AtomicBoolean warnCompile =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        private static final java.util.concurrent.atomic.AtomicBoolean warnEval =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        // EventCenter eventTickServer START 相位调用(主线程): 记 tick 边界时戳(t 的分子)
+        public static void onTickStart () {
+            tickStartNano = System.nanoTime();
+        }
+
+        // 热重载聚合入口(WatchConfigReload 线程调用): 三键直写 + 表达式重编译; 编译失败保留旧 Program
+        public static void reloadBudget (String mode, int budgetMs, String expr) {
+            Handcode.Config.deferred_queue_budget_mode = mode;
+            Handcode.Config.deferred_queue_budget_ms = budgetMs;
+            Handcode.Config.deferred_queue_budget_expr = expr;
+            compileProgram(Handcode.Config.deferred_queue_budget_expr);
+        }
+
+        // 编译(幂等, 双检锁): 源码未变跳过; 失败 warn-once + 保留旧 Program
+        private static void compileProgram (String expr) {
+            if (expr == null || expr.equals(budgetExprSource)) return;
+            synchronized (compileLock) {
+                try {
+                    tannyjung.tanshugetrees_core.ExprEngine.Program program =
+                            tannyjung.tanshugetrees_core.ExprEngine.compile(expr, BUDGET_VARS);
+                    budgetProgram = program;      // volatile 原子换装(旧 Program 引用自然淘汰)
+                    budgetExprSource = expr;
+                    warnCompile.set(false);        // 新源码重新武装编译告警
+                    System.out.println("[LMax] budget expr armed: '" + expr + "'");
+                } catch (tannyjung.tanshugetrees_core.ExprEngine.SyntaxException e) {
+                    if (warnCompile.compareAndSet(false, true)) {
+                        System.err.println("[LMax] budget expr compile failed, keeping previous program: " + e.getMessage());
+                    }
+                }
+            }
+        }
+
+        // 每 tick 求值(processTick 开头, 主线程): static 模式直读(零行为变化); expr 模式求值+回退链
+        private static long resolveBudgetMs () {
+            if (!"expr".equals(Handcode.Config.deferred_queue_budget_mode)) {
+                return Handcode.Config.deferred_queue_budget_ms; // V46 原语义: static 值 / <=0 = 暂停消费
+            }
+            if (budgetProgram == null || !Handcode.Config.deferred_queue_budget_expr.equals(budgetExprSource)) {
+                compileProgram(Handcode.Config.deferred_queue_budget_expr); // 启动 lazy 编译 / 热更新
+            }
+            tannyjung.tanshugetrees_core.ExprEngine.Program program = budgetProgram;
+            if (program == null) {
+                return Handcode.Config.deferred_queue_budget_ms; // 表达式从未编译成功 → static 回退
+            }
+            double t = (System.nanoTime() - tickStartNano) / 1_000_000.0;
+            evalVars[0] = t;
+            evalVars[1] = (double) lastDrainMs;
+            evalVars[2] = (double) depth.get();
+            double v = program.eval(evalVars);
+            if (Double.isFinite(v)) {
+                return (long) v; // 负值/0 = 暂停消费(语义与 static 一致); 上限不钳制=策略权在表达式作者
+            }
+            if (warnEval.compareAndSet(false, true)) {
+                System.err.println("[LMax] budget expr non-finite (NaN/Inf), falling back to " +
+                        Handcode.Config.deferred_queue_budget_ms + "ms: '" + Handcode.Config.deferred_queue_budget_expr + "'");
+            }
+            return Handcode.Config.deferred_queue_budget_ms;
+        }
+    }
+
+
+    // [LMax Fix V55 刀T] [长期记忆: 186] 跨线程就绪表：刀I"非 Server 线程 getChunkNow 读 visibleChunkMap
+    // 不可靠"（12帧盲区判例）的正解。ChunkEvent.Load 在 Server 线程（事件分发方）权威写入，CHM 线性
+    // 一致 = 任意线程零盲区读；Unload 摘表防卸载后假阳性命中（假阳性 = off-thread 强载 join/读侧竞态
+    // = 刀F 病灶复活通道，此表焊死它）。消费方：PlacementGate.gate off-thread 分支查表放行并行放置。
+    // 维护点：Load(markReady，proto 过滤+FULL 防御) / Unload(markUnloaded) / PlacementGate.clear 联动
+    // 清场。正确性向安全侧倾斜：摘表竞态导致的 miss 只退化为刀I 兜底，不损失。
+    public static class ReadyChunks {
+
+        // dimension（横杠串，与 Data/waiting 同格式）→ 已就绪 chunk 集合（CHM keySet，线性一致）
+        private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<ChunkPos>> ready
+                = new java.util.concurrent.ConcurrentHashMap<>();
+
+        // Load 事件写入（Server 线程权威）：instanceof LevelChunk 过滤 proto 期提前 Load（wake 判例同款），
+        // FULL 状态防御复检（可见 map 只收 FULL，与 gate 探测语义严格一致 = 双保险）
+        public static void markReady (String dimension, ChunkPos chunk_pos, net.minecraft.world.level.chunk.ChunkAccess chunk) {
+            if (chunk instanceof net.minecraft.world.level.chunk.LevelChunk == false) {
+                return;
+            }
+            if (((net.minecraft.world.level.chunk.LevelChunk) chunk).getHighestGeneratedStatus().isOrAfter(net.minecraft.world.level.chunk.ChunkStatus.FULL) == false) {
+                return;
+            }
+            ready.computeIfAbsent(dimension, k -> java.util.concurrent.ConcurrentHashMap.newKeySet()).add(chunk_pos);
+        }
+
+        // Unload 事件摘表：已卸载 chunk 查表必 miss → off-thread 走刀I 兜底（正确性向安全侧倾斜）
+        public static void markUnloaded (String dimension, ChunkPos chunk_pos) {
+            java.util.Set<ChunkPos> set = ready.get(dimension);
+            if (set != null) {
+                set.remove(chunk_pos);
+            }
+        }
+
+        // 足迹覆盖检查：off-thread gate 查表入口。containsAll 逐项 O(1) CHM 读，零管线访问零调度
+        public static boolean coversFootprint (String dimension, java.util.Set<ChunkPos> footprint) {
+            java.util.Set<ChunkPos> set = ready.get(dimension);
+            if (set == null) {
+                return false;
+            }
+            return set.containsAll(footprint);
+        }
+
+        // 世界切换清场（PlacementGate.clear 联动调用；AboutToStart/ServerStarted 双点全覆盖）
+        public static void clear () {
+            ready.clear();
+        }
+
+    }
+
+    // [LMax Fix V50 刀F] [长期记忆: 095] 放置就绪门 + Load 事件唤醒链（读侧强载洪峰根治，终审手术）
+    // 病理（V49 终审定案）：TXTFunction run 分支与放置路径对邻域 chunk 无门裸读——getBlockState 等 Level
+    // 便捷方法内部 getChunk(FULL,load=true) 强载 join——12 条 TreeGen 线程持续灌区块管线 → 主线程 35s 级
+    // 冻结×44 + region 扫描排队饿死（甜甜圈一角）。病灶为作者原装（TXTFunction 自 6eda304 起 0 diff），
+    // V38 池化收走"无限线程"旧免疫后两层病同时显症。
+    // 手术：start() 进放置循环前干跑解析树数据（每树 28 字节记录的 from/to 矩形并集 = 精确足迹），
+    // getChunkNow 纯读探测全部 FULL 才放行；任一未就绪 → 登记等待表，由 ChunkEvent.Load 事件唤醒重提交
+    // （事件驱动零轮询，与 V42 region-wake 链同构 = 空数据先例的对称半边）。门内所有读访问传递性安全，
+    // 此为 V16 注释承诺"不在生成期间直接访问邻近区块"的真正兑现。
+    // 并发协议：①exact-once 认领——waiting 原子摘表，双缺口并发到齐 / 与 gate 复查竞态均只放行一次
+    // （防双放置）；②insert-then-recheck——先登记后复查，关闭"检查与登记之间 chunk 恰好加载完成"的
+    // 竞态窗；③resubmit → start() → 门再验，自愈唤醒链中间态。
+    // 护栏：容量满 fail-open 放行（V7 同款思路；单 chunk 单次 join 有界，风暴需 12 线持续灌才成形，
+    // 不回归）；病态记录（跨度>64 chunk）fail-open 交原路径 try-catch 兜底。
+    public static class PlacementGate {
+
+        // primary（等待放置的 chunk）→ 尚未 FULL 的足迹 chunk 集合；外层 key = 维度横杠串（与 Data.get 同格式）
+        private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<ChunkPos, java.util.Set<ChunkPos>>> waiting
+                = new java.util.concurrent.ConcurrentHashMap<>();
+        // 反向索引：missing chunk → 等它的 primary 集合（Load 唤醒 O(1) 定位免全表扫；被认领 primary 的
+        // 残留反向项由各自 chunk 的 Load 自然消费，clear() 兜底清空）
+        private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<ChunkPos, java.util.Set<ChunkPos>>> reverse
+                = new java.util.concurrent.ConcurrentHashMap<>();
+
+        public static void clear () {
+            waiting.clear();
+            reverse.clear();
+            ReadyChunks.clear(); // [LMax Fix V55 刀T] 就绪表联动清场（世界切换，刀K 同族：旧世界就绪集不得泄漏进新世界查表）
+        }
+
+        // gate：true = 放行（足迹全就绪 / 门禁用 / 数据异常 fail-open）；false = 已登记等待，调用方直接返回
+        public static boolean gate (ServerLevel level_server, String dimension, ChunkPos chunk_pos, ByteBuffer data) {
+
+            if (Handcode.Config.placement_gate_enabled == false) {
+                return true; // 总开关（默认开）：false = 一键退回无门行为（诊断对照，免回档）
+            }
+        // [LMax Fix V50.2 刀I] [长期记忆: 100/101] 跨线程探针盲区根治：getChunkNow 从非 Server 线程读取
+        // visibleChunkMap 不可靠。世界54三进 A/B 实锤（同秒同批 chunk，唯一变量=线程）：Server 线程 DQ 探针
+        // 放行（chunk -1,-1 十九棵全放置），THT-TreeGen 线程 890/890 全盲——footprint 全额 missing，
+        // 含必然已加载的等待者自身（其进场凭证就是该 chunk 的 Load 事件）。
+        // 修复：非 Server 线程不再探测（结果不可信），转投 DeferredQueue NORMAL 任务——processTick 在
+        // Server 线程重跑 start()→gate() 精确足迹探测：就绪即放置（40ms/tick 预算滴灌，与既有 DQ 补种
+        // 同管道同限速）；未就绪则在此登记等待表，由 Load 唤醒链驱动（唤醒→resubmit→executor→再转 DQ，
+        // 每事件一跳，天然收敛）。顺治两病：①executor 主路径自始 100% 黑洞（历会话全部放置均出自
+        // DQ/Server 线程，无一例外）；②等待表孤儿——旧实现在 executor 线程登记后永远等不到"已加载
+        // chunk 的下一次 Load"，890 条目携旧解析数据滞留至关服（内存滞留+永不放置）。
+        if (level_server == null) {
+            return true; // 理论外路径（无 Server 上下文）：fail-open 交原路径兜底
+        }
+        if (Thread.currentThread().getName().equals("Server thread") == false) {
+            // [LMax Fix V55 刀T] [长期记忆: 186] off-thread 并行放行：ReadyChunks 查表（Load 事件 Server 线程权威写入，
+            // CHM 线性一致 = 刀I"非 Server 线程 getChunkNow 读 visibleChunkMap 不可靠"的正解——无可见性赌局）。
+            // 足迹全就绪 → 本 executor 线程直接放行放置（方块经 Tile.set 异步分支入 DeferredBlocks，start 尾段
+            // FORCED 冲刷主线程 setBlock(2) 落块，刀N 契约零破坏）；有缺/开关关 → 落下方原刀I 转投 DQ 兜底
+            // （Server 线程权威复查，正确性零损失，行为退化为刀I）。
+            if (Handcode.Config.placement_gate_parallel_offthread == true) {
+                java.util.HashSet<ChunkPos> footprint_pf = parseFootprint(data);
+                if (footprint_pf != null && footprint_pf.isEmpty() == false
+                        && ReadyChunks.coversFootprint(dimension, footprint_pf) == true) {
+                    if (Core.log_placer_start) System.out.println("[THT-DEBUG] PlacementGate PARALLEL PASS: chunk " + chunk_pos + " footprint=" + footprint_pf.size() + " (thread=" + Thread.currentThread().getName() + ")");
+                    return true;
+                }
+            }
+            // self= 为本线程对 primary 自身的探针现场：已加载却探为 null = 跨线程盲区活体证据
+            boolean self_seen = level_server.getChunkSource().getChunkNow(chunk_pos.x, chunk_pos.z) != null;
+            if (Core.log_placer_start) System.out.println("[THT-DEBUG] PlacementGate off-thread requeue: chunk " + chunk_pos + " self=" + self_seen + " (thread=" + Thread.currentThread().getName() + ")");
+            DeferredQueue.add(dimension, level_server.dimension(), chunk_pos);
+            return false;
+        }
+
+            // 干跑解析：duplicate 共享内容独立游标，不消费 start() 的正式 buffer
+            java.util.HashSet<ChunkPos> footprint = parseFootprint(data); // [LMax Fix V55 刀T] 内联干跑体上移为共享 helper（语义零漂移，原行内注释随体迁移见 parseFootprint）
+            if (footprint == null) {
+                return true; // 病态防御（原内联同语义）：from>to 或跨度>64 chunk 必为损坏记录 → fail-open 交原路径兜底
+            }
+            if (footprint.isEmpty() == true) {
+                return true; // 零足迹（异常数据形态）→ 放行由原路径兜底
+            }
+
+            // 纯读探测：getChunkNow 只查已加载 map（可见 map 只收 FULL），非 null 即就绪，不调度不等待
+            java.util.ArrayList<ChunkPos> missing = new java.util.ArrayList<>();
+            for (ChunkPos fp : footprint) {
+                net.minecraft.world.level.chunk.LevelChunk ready_chunk = level_server.getChunkSource().getChunkNow(fp.x, fp.z);
+                if (ready_chunk == null || ready_chunk.getHighestGeneratedStatus().isOrAfter(net.minecraft.world.level.chunk.ChunkStatus.FULL) == false) {
+                    missing.add(fp);
+                }
+            }
+            if (missing.isEmpty() == true) {
+                return true; // 足迹全就绪：放行，此后放置循环的所有读不再触发强载 join
+            }
+
+            // 容量护栏：等待表满 = 足迹 chunk 永不加载的滞留病态 → fail-open（详见类头注释）
+            java.util.concurrent.ConcurrentHashMap<ChunkPos, java.util.Set<ChunkPos>> primaries
+                    = waiting.computeIfAbsent(dimension, k -> new java.util.concurrent.ConcurrentHashMap<>());
+            if (primaries.size() >= Handcode.Config.placement_gate_max_waiting) {
+                return true;
+            }
+
+            // insert：primary → missing 集合 + 反向索引
+            java.util.Set<ChunkPos> missing_set = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            missing_set.addAll(missing);
+            primaries.put(chunk_pos, missing_set);
+            for (ChunkPos m : missing) {
+                reverse.computeIfAbsent(dimension, k -> new java.util.concurrent.ConcurrentHashMap<>())
+                        .computeIfAbsent(m, k -> java.util.concurrent.ConcurrentHashMap.newKeySet())
+                        .add(chunk_pos);
+            }
+
+            // then-recheck：登记期间缺口可能已被 Load 填补（wake 曾扑空）→ 复查摘除已就绪项
+            java.util.Iterator<ChunkPos> it = missing_set.iterator();
+            while (it.hasNext() == true) {
+                ChunkPos m = it.next();
+                net.minecraft.world.level.chunk.LevelChunk ready_chunk = level_server.getChunkSource().getChunkNow(m.x, m.z);
+                if (ready_chunk != null && ready_chunk.getHighestGeneratedStatus().isOrAfter(net.minecraft.world.level.chunk.ChunkStatus.FULL) == true) {
+                    it.remove();
+                    java.util.concurrent.ConcurrentHashMap<ChunkPos, java.util.Set<ChunkPos>> rev = reverse.get(dimension);
+                    if (rev != null) {
+                        java.util.Set<ChunkPos> rev_set = rev.get(m);
+                        if (rev_set != null) {
+                            rev_set.remove(chunk_pos);
+                        }
+                    }
+                }
+            }
+            if (missing_set.isEmpty() == true) {
+                // 复查后全就绪：原子摘表，成功者唯一放行（与并发 wake 认领互斥，防双放置）
+                if (primaries.remove(chunk_pos) != null) {
+                    return true;
+                } else {
+                    return false; // wake 已认领并 resubmit → 本线程退出，放置交给唤醒链
+                }
+            }
+
+            if (Core.log_placer_start) System.out.println("[THT-DEBUG] PlacementGate wait: chunk " + chunk_pos + " missing " + missing_set.size() + "/" + footprint.size() + " footprint chunks (dim=" + dimension + ")");
+            return false;
+        }
+
+        // [LMax Fix V55 刀T] 足迹解析提纯（原 gate 内联干跑体上移，语义零漂移）：28 字节/帧的 from/to 矩形
+        // 并集 = 树数据精确足迹。三消费方：gate Server 路径（就绪探测）/ gate off-thread 并行放行（ReadyChunks
+        // 查表）/ start 异步尾段（冲刷调度 scope）。返回 null = 病态帧（from>to 或跨度>64 chunk，调用方
+        // fail-open 兜底）；空 set = 零足迹（残帧/异常形态）。rewind 契约：start 尾段调用时正式 buffer 已被
+        // 放置循环消费（position==limit），duplicate 只复制游标不重置——显式 rewind 才能重放解析；gate 路径
+        // 调用时 position 本为 0，rewind 为无害 no-op。
+        private static java.util.HashSet<ChunkPos> parseFootprint (ByteBuffer data) {
+            java.util.HashSet<ChunkPos> footprint = new java.util.HashSet<>();
+            ByteBuffer probe = data.duplicate();
+            probe.rewind(); // [LMax Fix V55 刀T] 跨两种调用时点的游标归一（见上 rewind 契约）
+            while (probe.remaining() > 0) {
+                if (probe.remaining() < 28) break; // 残帧防御（正式解析自会按既有语义异常返回 0）
+                probe.getShort(); // id（干跑无需字典解析）
+                probe.getShort(); // chosen
+                probe.getInt(); // centerX
+                probe.getInt(); // centerZ
+                int from_chunkX = probe.getInt();
+                int from_chunkZ = probe.getInt();
+                int to_chunkX = probe.getInt();
+                int to_chunkZ = probe.getInt();
+                // 病态防御：跨度超 64 chunk（1024 格）必为损坏记录 → 调用方 fail-open 交原路径兜底
+                if (from_chunkX > to_chunkX || from_chunkZ > to_chunkZ || (to_chunkX - from_chunkX) > 64 || (to_chunkZ - from_chunkZ) > 64) {
+                    return null;
+                }
+                for (int x = from_chunkX; x <= to_chunkX; x++) {
+                    for (int z = from_chunkZ; z <= to_chunkZ; z++) {
+                        footprint.add(new ChunkPos(x, z));
+                    }
+                }
+            }
+            return footprint;
+        }
+
+        // wake：ChunkEvent.Load 事件入口（EventCenter 接线）。纯内存 map 操作微秒级，无磁盘/管线访问。
+        // 反向项 remove = exact-once 消费（同 chunk 重复 Load / proto 期提前触发均无副作用）。
+        public static void wake (ServerLevel level_server, ChunkPos loaded) {
+            String dimension = GameUtils.Space.getDimensionID(level_server).replace(":", "-");
+            java.util.concurrent.ConcurrentHashMap<ChunkPos, java.util.Set<ChunkPos>> rev = reverse.get(dimension);
+            if (rev == null) return;
+            java.util.Set<ChunkPos> primaries_waiting = rev.remove(loaded);
+            if (primaries_waiting == null) return;
+            for (ChunkPos primary : primaries_waiting) {
+                java.util.concurrent.ConcurrentHashMap<ChunkPos, java.util.Set<ChunkPos>> w = waiting.get(dimension);
+                if (w == null) continue;
+                java.util.Set<ChunkPos> missing_set = w.get(primary);
+                if (missing_set == null) continue;
+                missing_set.remove(loaded);
+                if (missing_set.isEmpty() == true) {
+                    // 原子认领：摘表成功者唯一提交（多缺口并发到齐 / 与 gate 复查竞态，均只放行一次）
+                    if (w.remove(primary) != null) {
+                        if (Core.log_placer_start) System.out.println("[THT-DEBUG] PlacementGate wake: chunk " + primary + " footprint complete, resubmit (dim=" + dimension + ")");
+                        tannyjung.tanshugetrees_core.game.EventCenter.Server.resubmitPlacement(level_server, dimension, primary);
+                    }
+                }
+            }
+        }
+    }
+    // [LMax Fix V42] 返回值语义：0=本次未写入任何方块（空数据且无 pending / 解析异常）；1=可能写入了方块（调用方应 resync）
+    // [LMax Fix V50.4 刀K] [长期记忆: 104] 世界切换静态池清场（EventCenter AboutToStart 钩子聚合调用）。
+    // 清理清单：DQ 队列（旧世界重试任务不泄漏进新世界消费循环）/ Data 解析 future（击杀链第三段
+    // 跨世界投毒源：旧 future 含旧世界树记录）/ LeafLitter 与 Function 分组缓存 / DeferredBlocks
+    // 写入意图（core 层原语，旧意图不清 = 旧方块灌进新世界 = 跨世界幽灵投毒）/ PlacementGate 等待表
+    // （复用刀F clear，其内部 Started 语义保留，冗余无害不动刀F遗产）。
+    public static void clearWorldState () {
+        DeferredQueue.queue.clear();
+        Data.clear();
+        LeafLitterGeneration.cache_locations.clear();
+        Function.cache_functions.clear();
+        tannyjung.tanshugetrees_core.game.DeferredBlocks.clear();
+        PlacementGate.clear();
+    }
+
+    public static int start (LevelAccessor level_accessor, ServerLevel level_server, ChunkGenerator chunk_generator, String dimension, ChunkPos chunk_pos) {
+
+        // [MODS-CONFIG] 维度过滤最终闸: 所有入口(世界生成 feature / chunk load / 唤醒重提交 / DQ)最终都汇到这里,
+        // 过滤维度在这里 return 0 即可, 既不读盘也不写方块缓存.
+        if (tannyjung.tanshugetrees_handcode.Handcode.Config.isDimensionAllowed(dimension) == false) {
+
+            return 0;
+
+        }
+
+        Core.GlobalLocking.test();
+
+        // [LMax Fix V42] speculative register：读数据前先登记 churn 等待集 [长期记忆: 014]
+        // 竞态防御：若先读后登记，可能错过"读取之后才完成的 region"的唤醒（T0读空→T1完成+wake未登记→
+        // T2登记时邻region已全TRUE→误判终态漏树）。先登记保证任何后完成的 region 都能唤醒本 chunk；
+        // 读到数据后立即注销（下方），等待集不会积累。
+        TreeLocation.registerPendingEmpty(dimension, chunk_pos);
+        ByteBuffer data = Data.get(dimension, chunk_pos);
+
+        if (data.remaining() == 0) {
+            // [LMax Debug V39] 诊断：空数据chunk是否也有缓存的方块（跨chunk树方块）
+            if (Core.log_placer_start) System.out.println("[THT-DEBUG] TreePlacer.start() chunk " + chunk_pos + " EARLY RETURN (no tree data)");
+            // [LMax Fix V39] 即使没有树数据，当前chunk可能被相邻chunk的树写入了方块，必须尝试place
+            // [LMax Fix V42] place 现返回实际落块数：>0 说明本 chunk 有跨 chunk 方块落地，调用方需要 resync
+            // [LMax Fix V50.4 刀N] 异步线程冲刷转投：Tile.set 已改无条件 DeferredBlocks.add，此处若直接
+            // place 将 take→set→add 回原缓存 = 永动机（方块永不落地）。转投 DQ forced 任务由主线程
+            // processTick 消费（就绪检查 + setBlock(2) 全主线程闭环）；主线程重入（DQ NORMAL 消费）保持
+            // 直接冲刷。理论外 level_server==null 保留原语义（无 DQ 上下文，place 走缓存滞留等重载冲刷）。
+            int placed_pending;
+            if (level_server != null && Thread.currentThread().getName().equals("Server thread") == false) {
+                DeferredQueue.addForced(dimension, level_server.dimension(), chunk_pos, chunk_pos);
+                placed_pending = 0;
+            } else {
+                placed_pending = PendingBlocks.place(level_accessor, chunk_pos);
+            }
+// [LMax Fix V50.1 刀G] [长期记忆: 095] 空读自愈钩子（冷启动零树根治）。
+            // 病理：region 扫描收尾三连 writeBIN→Data.invalidate→wake，被唤醒的 start() 撞上
+            // 「旧 future 已失效、新 future 重解析在飞」窗口——Data.get 对未完成 future 直接返回空，
+            // DQ 任务读空即被消费（重试只保 chunk 就绪不保数据非空），wake 每 region 只发一次且
+            // set.remove 先于任务执行 → 三路驱动烧尽，磁盘上万条记录无人消费（世界53 实测零树，
+            // 世界52 历史 bin 掩盖断链）。修复：空读遇 in-flight future 挂 thenRun 完成回调，
+            // 数据到手事件直达重提交——与 V42 region-wake / V50 chunk-Load 同构的第三条事件链，
+            // 三链全部汇入 EventCenter.Server.resubmitPlacement 同一入口，事件驱动零轮询。
+            // 终态分支同样受益：TERMINAL 判定后钩子仍会带数据回放（future 完成非空时）。
+            // 双放置无虞：树记录由世界种子确定性派生（RandomSource 同种子同方块），重复写入幂等。
+            // level_server 为 null 的理论外路径不挂钩，保留 pendingEmpty 等待语义。
+            if (level_server != null) {
+                Data.onRegionParsed(dimension, chunk_pos.x >> 5, chunk_pos.z >> 5, () -> {
+                    try {
+                        if (Core.log_placer_start) System.out.println("[THT-DEBUG] V50.1-G hook fired: resubmit chunk " + chunk_pos);
+                        tannyjung.tanshugetrees_core.game.EventCenter.Server.resubmitPlacement(level_server, dimension, chunk_pos);
+                    } catch (Exception e) {
+                        Core.logger.error("[THT-DEBUG] V50.1-G resubmit hook failed for chunk " + chunk_pos, e);
+                    }
+                });
+            }
+            // [LMax Fix V42] churn 斩杀：空数据不再 DeferredQueue.add 无限重入队（旧实现单日 64.6 万次
+            // 空转重入，队列永久满载挤压真实 forced 载荷）。改为等待 TreeLocation 的 region 完成事件唤醒；
+            // 3×3 邻 region 全部完成仍无数据 = 确定终态，注销退出（本 chunk 的树记录确定不存在）
+            if (TreeLocation.allNeighborRegionsComplete(dimension, chunk_pos) == true) {
+                TreeLocation.unregisterPendingEmpty(dimension, chunk_pos);
+                if (Core.log_placer_start) System.out.println("[THT-DEBUG] EARLY RETURN chunk " + chunk_pos + " TERMINAL: 3x3 neighbor regions complete, no tree data (unregistered)");
+            } else {
+                if (Core.log_placer_start) System.out.println("[THT-DEBUG] EARLY RETURN chunk " + chunk_pos + " waiting for region wake | pending placed: " + placed_pending);
+            }
+            return (placed_pending > 0) ? 1 : 0;
+        }
+
+        // [LMax Fix V42] 读到数据 → 立即注销等待集，本 chunk 不再需要唤醒（speculative register 的对偶操作）
+        TreeLocation.unregisterPendingEmpty(dimension, chunk_pos);
+
+        // [LMax Fix V50 刀F] [长期记忆: 095] 放置就绪门：进放置循环前干跑解析树数据收集精确足迹 chunk
+        // （from/to 矩形并集），getChunkNow 纯读探测（只查已加载 map，不调度不等待）全部 FULL 才放行；
+        // 任一未就绪 → PlacementGate 登记等待，由 ChunkEvent.Load 事件唤醒重提交（异步线程，零轮询）。
+        // 病理与并发协议详见 PlacementGate 类头注释。返回 0 = 本次未写入方块（V42 语义，调用方不 resync）。
+        if (PlacementGate.gate(level_server, dimension, chunk_pos, data) == false) {
+            return 0;
+        }
+
+        // [LMax Debug] 追踪 TreePlacer 执行情况
+        int data_size = data.remaining();
+        long placer_start = System.currentTimeMillis();
+        if (Core.log_placer_start) System.out.println("[THT-DEBUG] TreePlacer.start() chunk " + chunk_pos + " data: " + data_size + " bytes");
+
+        String id = "";
+        String chosen = "";
+        int centerX = 0;
+        int centerZ = 0;
+        int from_chunkX = 0;
+        int from_chunkZ = 0;
+        int to_chunkX = 0;
+        int to_chunkZ = 0;
+
+        while (data.remaining() > 0) {
+
+            // Get data
+            {
+
+                try {
+
+                    id = CacheManager.getDictionary(String.valueOf(data.getShort()), true);
+                    chosen = CacheManager.getDictionary(String.valueOf(data.getShort()), true);
+                    centerX = data.getInt();
+                    centerZ = data.getInt();
+                    from_chunkX = data.getInt();
+                    from_chunkZ = data.getInt();
+                    to_chunkX = data.getInt();
+                    to_chunkZ = data.getInt();
+
+                } catch (Exception exception) {
+
+                    OutsideUtils.exception(new Exception(), exception, "");
+                        return 0; // [LMax Fix V42] 返回值语义：0=未写入任何方块（解析异常）
+
+                }
+
+            }
+
+            DetailedDetection.test(level_accessor, level_server, chunk_generator, dimension, chunk_pos, from_chunkX, from_chunkZ, to_chunkX, to_chunkZ, id, chosen, centerX, centerZ);
+        }
+
+        // [LMax Fix V55 刀T] [长期记忆: 186] 尾段线程分流：off-thread（刀T 并行放行路径）直调本 place =
+        // take→Tile.set（异步分支）→add 回 DeferredBlocks 永动机（刀N 注释自述死环，空数据分支同款防御
+        // 先例）；LeafLitter.create 写入器线程语义未验证，一并押后 FORCED 主线程消费。Server 线程保持 V20
+        // 原语义（processTick NORMAL 路径，历史行为零漂移）。理论外 level_server==null 镜像空数据分支判例：
+        // 无 DQ 上下文，保留原语义（缓存滞留等重载冲刷，现实零流量）。
+        if (Thread.currentThread().getName().equals("Server thread") == true || level_server == null) {
+            // [LMax Fix V20] 解除主线程封印：让 PendingBlocks 回归异步线程直接写入
+            // 彻底解决主线程被海量方块写入卡死，导致区块发包延迟和 TPS 归零的问题
+            PendingBlocks.place(level_accessor, chunk_pos);
+            LeafLitterGeneration.place(level_accessor, level_server, chunk_generator, chunk_pos);
+        } else {
+            // [LMax Fix V55 刀T] 异步尾段：方块已在放置循环经 Tile.set 异步分支全量入 DeferredBlocks 缓存；
+            // 此处对 footprint∪{primary} 逐 chunk 入 FORCED 冲刷任务（processTick 主线程就绪复查 + setBlock(2)
+            // 落块 = 刀N 契约闭环）。邻 chunk 已加载时不再有 Load 事件（不调度 = 冲刷链断，A3 回型甜甜圈同构），
+            // 必须主动扫投；chunk 未就绪则 FORCED 复查拦截，缓存留存下次冲刷零丢失。
+            java.util.HashSet<ChunkPos> flush_scope = PlacementGate.parseFootprint(data);
+            if (flush_scope == null) {
+                flush_scope = new java.util.HashSet<>(); // 病态帧：gate 已 fail-open 放行，尾段退化为仅 primary（下方 add 兜底）
+            }
+            flush_scope.add(chunk_pos);
+            for (ChunkPos fp : flush_scope) {
+                DeferredQueue.addForced(dimension, level_server.dimension(), fp, fp);
+            }
+        }
+
+        // [LMax Debug] 追踪 TreePlacer 完成时间
+        long placer_time = System.currentTimeMillis() - placer_start;
+        if (placer_time > 100) {
+            if (Core.log_placer_start) Core.logger.info("[THT-DEBUG] TreePlacer.start() chunk " + chunk_pos + " completed in " + placer_time + "ms (data was " + data_size + " bytes)");
+        }
+        // [LMax Fix V42] 返回值语义：1=进入了正常种树路径（保守视为可能写入了方块，调用方应 resync）
+        return 1;
+    }
+
+    // [LMax Fix V42] requeueChunk：TreeLocation.wakeOnRegionComplete 的事件唤醒入口。
+    // 被 region 完成事件唤醒的空数据 chunk 从这里重新入队（NORMAL 路径），
+    // processTick 自带 FULL 就绪检查与重试上限，未就绪不会重跑 start。
+    public static void requeueChunk (String dimension, net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dim_key, ChunkPos chunk_pos) {
+        DeferredQueue.add(dimension, dim_key, chunk_pos);
+    }
+
+    private static int[] getPartReduce (LevelAccessor level_accessor, String location, int centerX, int centerZ, int dead_tree_level) {
+
+        RandomSource random = RandomSource.create(level_accessor.getServer().overworld().getSeed() ^ ((centerX * 341873128712L) + (centerZ * 132897987541L)));
+        int count_trunk = 0;
+        int count_bough = 0;
+        int count_branch = 0;
+        int count_limb = 0;
+        int count_twig = 0;
+        int count_sprig = 0;
+
+        // Get Data
+        {
+
+            try {
+
+                int[] data = Caches.TreeShape.getTreeShapeBlockCount(location);
+                count_trunk = data[0];
+                count_bough = data[1];
+                count_branch = data[2];
+                count_limb = data[3];
+                count_twig = data[4];
+                count_sprig = data[5];
+
+            } catch (Exception exception) {
+
+                OutsideUtils.exception(new Exception(), exception, "");
+                return new int[0];
+
+            }
+
+        }
+
+        // Convert Dead Level
+        {
+
+            if (dead_tree_level < 200) {
+
+                dead_tree_level = dead_tree_level - 100;
+
+            } else if (dead_tree_level < 300) {
+
+                dead_tree_level = dead_tree_level - 200;
+
+            } else if (dead_tree_level < 400) {
+
+                dead_tree_level = dead_tree_level - 300;
+
+            }
+
+        }
+
+        if (dead_tree_level >= 60) {
+
+            // Only Trunk
+            {
+
+                count_bough = 0;
+                count_branch = 0;
+                count_limb = 0;
+                count_twig = 0;
+                count_sprig = 0;
+
+                if (dead_tree_level == 60 || dead_tree_level == 70) {
+
+                    count_trunk = (int) (Mth.nextDouble(random, 0.5, 1.0) * (double) count_trunk);
+
+                } else if (dead_tree_level == 80 || dead_tree_level == 90) {
+
+                    count_trunk = (int) (Mth.nextDouble(random, 0.1, 0.5) * (double) count_trunk);
+
+                }
+
+            }
+
+        } else {
+
+            // General
+            {
+
+                if (dead_tree_level == 50) {
+
+                    count_bough = (int) (random.nextDouble() * count_bough);
+
+                }
+
+                if (dead_tree_level < 50) {
+
+                    if (dead_tree_level == 40) {
+
+                        count_branch = (int) (random.nextDouble() * count_branch);
+
+                    }
+
+                } else {
+
+                    count_branch = 0;
+
+                }
+
+                if (dead_tree_level < 40) {
+
+                    if (dead_tree_level == 30 && count_limb > 0) {
+
+                        count_limb = (int) (random.nextDouble() * count_limb);
+
+                    }
+
+                } else {
+
+                    count_limb = 0;
+
+                }
+
+                if (dead_tree_level < 30) {
+
+                    if (dead_tree_level == 20 && count_twig > 0) {
+
+                        count_twig = (int) (random.nextDouble() * count_twig);
+
+                    }
+
+                } else {
+
+                    count_twig = 0;
+
+                }
+
+                if (dead_tree_level < 20) {
+
+                    if (dead_tree_level == 10 && count_sprig > 0) {
+
+                        count_sprig = (int) (random.nextDouble() * count_sprig);
+
+                    }
+
+                } else {
+
+                    count_sprig = 0;
+
+                }
+
+            }
+
+        }
+
+        return new int[]{count_trunk, count_bough, count_branch, count_limb, count_twig, count_sprig};
+
+    }
+
+    // [方向A重构] 原 place() 拆分为 placeCalculate()（计算+分组缓存）+ PendingBlocks.place()（拉取+写入）
+    // 移除 chunk 过滤，所有方块统一存入 PendingBlocks，由各 chunk 的 place() 统一写入
+    private static void placeCalculate (LevelAccessor level_accessor, ServerLevel level_server, ChunkPos chunk_pos, String id, String location, String path_settings, BlockPos pos_center, int[] rotation_mirrored, int dead_tree_level, int fallen_direction) {
+
+        boolean can_disable_roots = false;
+        boolean can_leaves_decay = false;
+        boolean can_leaves_drop = false;
+        boolean can_leaves_regrow = false;
+
+        // Get Data
+        {
+
+            Map<String, String> data_normal = Caches.TreeSettings.getNormal(path_settings);
+            can_disable_roots = data_normal.getOrDefault("can_disable_roots", "").equals("true");
+            can_leaves_decay = data_normal.getOrDefault("can_leaves_decay", "").equals("true");
+            can_leaves_drop = data_normal.getOrDefault("can_leaves_drop", "").equals("true");
+            can_leaves_regrow = data_normal.getOrDefault("can_leaves_regrow", "").equals("true");
+
+        }
+
+        Map<Short, BlockState> blocks = Caches.TreeSettings.getBlock(level_server, path_settings);
+        Set<Short> keep = Caches.TreeSettings.getKeep(path_settings);
+        short[] leaves_type = Caches.TreeSettings.getLeavesType(path_settings);
+        Map<Short, String> functions = Caches.TreeSettings.getFunction(path_settings);
+        List<String> tree_decoration_normal = getTreeDecoration("normal");
+        List<String> tree_decoration_decay = getTreeDecoration("decay");
+
+        boolean coarse_woody_debris = false;
+        boolean no_roots = false;
+        boolean hollowed = false;
+        boolean abscission = false;
+        int reduce_trunk = 0;
+        int reduce_bough = 0;
+        int reduce_branch = 0;
+        int reduce_limb = 0;
+        int reduce_twig = 0;
+        int reduce_sprig = 0;
+
+        if (dead_tree_level == 0) {
+
+            {
+
+                no_roots = Handcode.Config.world_gen_roots == false && can_disable_roots == true;
+
+                if (Handcode.Config.abscission_world_gen == true) {
+
+                    if (leaves_type[0] == 1 || leaves_type[1] == 1) {
+
+                        if (GameUtils.Environment.test(GameUtils.Environment.getAt(level_accessor, pos_center), "#tanshugetrees:snowy_biomes") == true) {
+
+                            abscission = true;
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        } else {
+
+            {
+
+                // Get Reduce
+                {
+
+                    try {
+
+                        int[] data = getPartReduce(level_accessor, location, pos_center.getX(), pos_center.getZ(), dead_tree_level);
+                        reduce_trunk = data[0];
+                        reduce_bough = data[1];
+                        reduce_branch = data[2];
+                        reduce_limb = data[3];
+                        reduce_twig = data[4];
+                        reduce_sprig = data[5];
+
+                    } catch (Exception exception) {
+
+                        OutsideUtils.exception(new Exception(), exception, "");
+                        return;
+
+                    }
+
+                }
+
+                boolean force_no_roots = false;
+
+                if (dead_tree_level < 200) {
+
+                    dead_tree_level = dead_tree_level - 100;
+
+                } else if (dead_tree_level < 300) {
+
+                    dead_tree_level = dead_tree_level - 200;
+                    coarse_woody_debris = true;
+
+                } else if (dead_tree_level < 400) {
+
+                    dead_tree_level = dead_tree_level - 300;
+                    coarse_woody_debris = true;
+                    force_no_roots = true;
+
+                }
+
+                if (dead_tree_level == 70 || dead_tree_level == 90) {
+
+                    hollowed = true;
+
+                }
+
+                if (force_no_roots == true) {
+
+                    no_roots = true;
+
+                }
+
+            }
+
+        }
+
+        boolean can_run_function = false;
+        BlockState block = null;
+        String function = "";
+        BlockPos pos = null;
+        boolean is_leaves = false;
+        boolean is_function = false;
+        double leaf_litter_chance = 0.0;
+
+        int loop = 0;
+        short type = 0;
+        short posX = 0;
+        short posY = 0;
+        short posZ = 0;
+
+        // [LMax Debug] 追踪形状数据大小
+        short[] shape_data = Caches.TreeShape.getTreeShapeData(location);
+        if (Core.log_place_calculate) System.out.println("[THT-DEBUG] placeCalculate '" + id + "' shape blocks: " + shape_data.length);
+
+        for (short scan : shape_data) {
+
+            // Loop Skip
+            {
+
+                loop = loop + 1;
+
+                if (loop == 1) {
+
+                    type = scan;
+
+                } else if (loop == 2) {
+
+                    posX = scan;
+
+                } else if (loop == 3) {
+
+                    posY = scan;
+
+                } else {
+
+                    posZ = scan;
+                    loop = 0;
+
+                }
+
+                if (loop > 0) {
+
+                    continue;
+
+                }
+
+            }
+
+            is_leaves = OutsideUtils.Mathematics.isNumberStartWith(type, 120) == true;
+            is_function = OutsideUtils.Mathematics.isNumberStartWith(type, 2) == true;
+
+            if (is_function == false) {
+
+                can_run_function = false;
+
+                // Dead Tree Reduction
+                {
+
+                    if (dead_tree_level > 0) {
+
+                        if (is_leaves == true) {
+
+                            continue;
+
+                        } else {
+
+                            // Basic Style
+                            {
+
+                                if (OutsideUtils.Mathematics.isNumberStartWith(type, 119) == true) {
+
+                                    if (reduce_sprig > 0) {
+
+                                        reduce_sprig = reduce_sprig - 1;
+
+                                    } else {
+
+                                        continue;
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 118) == true) {
+
+                                    if (reduce_sprig == 0) {
+
+                                        if (reduce_twig > 0) {
+
+                                            reduce_twig = reduce_twig - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 117) == true) {
+
+                                    if (reduce_twig == 0) {
+
+                                        if (reduce_limb > 0) {
+
+                                            reduce_limb = reduce_limb - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 116) == true) {
+
+                                    if (reduce_limb == 0) {
+
+                                        if (reduce_branch > 0) {
+
+                                            reduce_branch = reduce_branch - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 115) == true) {
+
+                                    if (reduce_branch == 0) {
+
+                                        if (reduce_bough > 0) {
+
+                                            reduce_bough = reduce_bough - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                            if (dead_tree_level >= 60) {
+
+                                // Only Trunk
+                                {
+
+                                    if (OutsideUtils.Mathematics.isNumberStartWith(type, 114) == true) {
+
+                                        if (reduce_trunk > 0) {
+
+                                            reduce_trunk = reduce_trunk - 1;
+
+                                            if (hollowed == true) {
+
+                                                if (type == 1143) {
+
+                                                    continue;
+
+                                                }
+
+                                            }
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+                pos = new BlockPos(posX, posY, posZ);
+                pos = OutsideUtils.convertPosRotationMirrored(pos, rotation_mirrored);
+                pos = OutsideUtils.convertPosFallen(pos, fallen_direction);
+                pos = pos.offset(pos_center.getX(), pos_center.getY(), pos_center.getZ());
+
+                // [方向A重构] 移除 chunk 过滤，所有方块统一处理
+                if (is_function == false) {
+
+                    block = blocks.get(type);
+
+                    if (block == null) {
+
+                        continue;
+
+                    }
+
+                    // Keep
+                    {
+
+                        if (keep.contains(type) == true) {
+
+                            if (level_accessor.getBlockState(pos).isAir() == false) {
+
+                                continue;
+
+                            }
+
+                        }
+
+                    }
+
+                    // No Roots
+                    {
+
+                        if (coarse_woody_debris == false) {
+
+                            if (no_roots == true) {
+
+                                if (OutsideUtils.Mathematics.isNumberStartWith(type, 111) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 112) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 113) == true) {
+
+                                    continue;
+
+                                }
+
+                            }
+
+                        } else {
+
+                            if (OutsideUtils.Mathematics.isNumberStartWith(type, 112) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 113) == true) {
+
+                                continue;
+
+                            }
+
+                            if (no_roots == true) {
+
+                                if (OutsideUtils.Mathematics.isNumberStartWith(type, 110) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 111) == true) {
+
+                                    continue;
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    RandomSource random = RandomSource.create(level_accessor.getServer().overworld().getSeed() ^ ((pos.getX() * 341873128712L) + (pos.getZ() * 132897987541L)) * pos.getY());
+
+                    if (is_leaves == true) {
+
+                        // Leaf Litter
+                        {
+
+                            if (can_leaves_drop == true) {
+
+                                if (Handcode.Config.leaf_litter == true && Handcode.Config.leaf_litter_world_gen == true) {
+
+                                    if ((OutsideUtils.Mathematics.isNumberEndWith(type, 1) == true && leaves_type[0] == 2) || (OutsideUtils.Mathematics.isNumberEndWith(type, 2) == true && leaves_type[1] == 2)) {
+
+                                        leaf_litter_chance = Handcode.Config.leaf_litter_world_gen_chance_coniferous;
+
+                                    } else {
+
+                                        leaf_litter_chance = Handcode.Config.leaf_litter_world_gen_chance;
+
+                                    }
+
+                                    if (random.nextDouble() < leaf_litter_chance) {
+
+                                        // [方向A重构] 用方块所在 chunk 而非中心 chunk
+                                        LeafLitterGeneration.add(new ChunkPos(pos), pos, block);
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                        // Abscission
+                        {
+
+                            if (abscission == true) {
+
+                                continue;
+
+                            }
+
+                        }
+
+                    }
+
+                    // [方向A重构] 所有方块统一存入 PendingBlocks，由各 chunk 的 place() 统一写入
+                    PendingBlocks.add(pos, block);
+
+                    // Tree Decoration
+                    {
+
+                        if (Handcode.Config.tree_decorations == true) {
+
+                            if (is_leaves == false) {
+
+                                if (random.nextDouble() < Handcode.Config.tree_decorations_normal_chance) {
+
+                                    if (tree_decoration_normal.isEmpty() == false) {
+
+                                        // [方向A重构] 用方块所在 chunk
+                                        Function.add(new ChunkPos(pos), pos, tree_decoration_normal.get(random.nextInt(tree_decoration_normal.size())));
+
+                                    }
+
+                                }
+
+                            }
+
+                            if (dead_tree_level > 0) {
+
+                                if (random.nextDouble() < Handcode.Config.tree_decorations_decay_chance) {
+
+                                    if (tree_decoration_decay.isEmpty() == false) {
+
+                                        // [方向A重构] 用方块所在 chunk
+                                        Function.add(new ChunkPos(pos), pos, tree_decoration_decay.get(random.nextInt(tree_decoration_decay.size())));
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    // Summon Marker
+                    {
+
+                        // At Center
+                        if (posX == 0 && posY == 0 && posZ == 0) {
+
+                            if (Handcode.Config.tree_location == true && dead_tree_level == 0) {
+
+                                if (can_leaves_decay == true || can_leaves_drop == true || can_leaves_regrow == true) {
+
+                                    String marker_data = "{ForgeData:{tanshugetrees:{file:\"" + location + "\",tree_settings:\"" + path_settings + "\",rotation:" + rotation_mirrored[0] + ",mirrored:" + rotation_mirrored[1] + "}}}";
+                                    GameUtils.Mob.summonWorldGen(level_server, pos.getCenter(), "minecraft:marker", id, "TANSHUGETREES-tree_location", marker_data);
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    can_run_function = true;
+
+                } else {
+
+                    // Function
+                    {
+                        // Separate because start and end function no need to test "can run here?"
+                        if (can_run_function == true || type == 210 || type == 220) {
+
+                            function = functions.get(type);
+
+                            if (function == null) {
+
+                                continue;
+
+                            }
+
+                            // [方向A重构] 用方块所在 chunk
+                            Function.add(new ChunkPos(pos), pos, function);
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    private static List<String> getTreeDecoration (String type) {
+
+        List<String> data = CacheManager.DataText.getList("tree_decorations").get(type);
+
+        if (data == null) {
+
+            data = new ArrayList<>();
+            String[] names = null;
+
+            // Get List of Names
+            {
+
+                if (type.equals("normal") == true) {
+
+                    names = new File(Core.path_config + "/dev/temporary/tree_decorations").list();
+
+                } else {
+
+                    names = new File(Core.path_config + "/dev/temporary/tree_decorations/decay").list();
+
+                }
+
+                if (names == null) {
+
+                    names = new String[0];
+
+                }
+
+            }
+
+            for (String name : names) {
+
+                if (name.endsWith(".txt") == true) {
+
+                    name = name.substring(0, name.length() - ".txt".length());
+
+                    if (type.equals("normal") == true) {
+
+                        name = "tree_decorations/" + name;
+
+                    } else {
+
+                        name = "tree_decorations/decay/" + name;
+
+                    }
+
+                    data.add(name);
+
+                }
+
+            }
+
+            CacheManager.DataText.setList("tree_decorations", type, data);
+
+        }
+
+        return data;
+
+    }
+
+    public static class Data {
+
+        // [LMax Fix V3]彻底废除同步等待，改用 CompletableFuture 异步加载。
+        // 任何线程请求数据时，如果未加载完成，直接返回空，绝不阻塞当前线程。
+        // 彻底根除 DH 线程池排队、主线程级联卡死的问题。
+        private static final Map<String, java.util.concurrent.CompletableFuture<Map<ChunkPos, ByteArrayOutputStream>>> bin_convert_futures = new java.util.concurrent.ConcurrentHashMap<>();
+
+        public static void clear () {
+            bin_convert_futures.clear();
+        }
+        // [LMax Fix V41] 负缓存失效入口 [长期记忆: 012]
+        // 根因：get() 的 computeIfAbsent 将“region 文件尚不存在”这一瞬时状态解析为空 map 并永久缓存
+        // （本会话 region key 数远小于 256 淘汰阈值，且无任何失效路径），数据落盘后读方仍命中空结果
+        // → 25442/25442 全空读 → 零树。修复：生产者 TreeLocation.flushCachesAsync 落盘后调用本方法
+        // 失效对应 region 的 future；消费方（DeferredQueue 400tick 重试节奏）下次 get 重新读盘。事件驱动零轮询。
+        public static void invalidate (String dimension, int regionX, int regionZ) {
+            bin_convert_futures.remove(dimension + "/" + regionX + "," + regionZ);
+        }
+
+// [LMax Fix V50.1 刀G] [长期记忆: 095] 空读自愈钩子：暴露 in-flight future 的完成事件给消费方。
+        // 返回 true = future 在飞且回调已挂上（其完成后执行 action）；false = 无在飞解析（已完成或
+        // 不存在），调用方走原 pendingEmpty / 终态路径。同一 future 可被多路空读各挂一个回调，各自
+        // 触发一次重提交；重复放置由树记录确定性派生保证幂等。future 被 invalidate 移除后仍会正常
+        // 完成并触发已挂回调（remove 只摘 map 引用，future 对象本体存活），链条自愈无悬挂键。
+        public static boolean onRegionParsed (String dimension, int regionX, int regionZ, Runnable action) {
+            java.util.concurrent.CompletableFuture<Map<ChunkPos, ByteArrayOutputStream>> future =
+                    bin_convert_futures.get(dimension + "/" + regionX + "," + regionZ);
+            if (future == null || future.isDone()) {
+                return false;
+            }
+            future.thenRun(action);
+            return true;
+        }
+        private static void clearChunk (String dimension, ChunkPos chunk_pos) {
+            // 异步模式下，clearChunk 操作变得复杂且无必要，直接清空整个 Future 缓存即可。
+        }
+
+        private static ByteBuffer get (String dimension, ChunkPos chunk_pos) {
+            int regionX = chunk_pos.x >> 5;
+            int regionZ = chunk_pos.z >> 5;
+
+            String key = dimension + "/" + regionX + "," + regionZ;
+
+            // [LMax Fix V7] 容量上限淘汰，防止 bin_convert_futures 无限增长导致 OOM
+            if (!bin_convert_futures.containsKey(key)) {
+                while (bin_convert_futures.size() >= Handcode.Config.bin_convert_futures_max_entries) {
+                    java.util.Iterator<Map.Entry<String, java.util.concurrent.CompletableFuture<Map<ChunkPos, ByteArrayOutputStream>>>> it = bin_convert_futures.entrySet().iterator();
+                    if (it.hasNext()) {
+                        it.next();
+                        it.remove();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            java.util.concurrent.CompletableFuture<Map<ChunkPos, ByteArrayOutputStream>> future = bin_convert_futures.computeIfAbsent(key, k ->
+                java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                    Map<ChunkPos, ByteArrayOutputStream> regionData = new HashMap<>();
+                    ByteBuffer bin = FileManager.readBIN(Core.path_world_mod + "/world_gen/place/" + k + ".bin");
+                    if (bin != null) {
+                        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                        int from_chunkX = 0;
+                        int from_chunkZ = 0;
+                        int to_chunkX = 0;
+                        int to_chunkZ = 0;
+                        short id = 0;
+                        short chosen = 0;
+                        int centerX = 0;
+                        int centerZ = 0;
+
+                        while (bin.remaining() > 0) {
+                            try {
+                                id = bin.getShort();
+                                chosen = bin.getShort();
+                                centerX = bin.getInt();
+                                centerZ = bin.getInt();
+                                from_chunkX = bin.getInt();
+                                from_chunkZ = bin.getInt();
+                                to_chunkX = bin.getInt();
+                                to_chunkZ = bin.getInt();
+
+                                stream.reset();
+                                stream.write(OutsideUtils.Data.convertShortToArrayByte(id));
+                                stream.write(OutsideUtils.Data.convertShortToArrayByte(chosen));
+                                stream.write(OutsideUtils.Data.convertIntToArrayByte(centerX));
+                                stream.write(OutsideUtils.Data.convertIntToArrayByte(centerZ));
+                                stream.write(OutsideUtils.Data.convertIntToArrayByte(from_chunkX));
+                                stream.write(OutsideUtils.Data.convertIntToArrayByte(from_chunkZ));
+                                stream.write(OutsideUtils.Data.convertIntToArrayByte(to_chunkX));
+                                stream.write(OutsideUtils.Data.convertIntToArrayByte(to_chunkZ));
+
+                                for (int scanX = from_chunkX; scanX <= to_chunkX; scanX++) {
+                                    for (int scanZ = from_chunkZ; scanZ <= to_chunkZ; scanZ++) {
+                                        if (regionX == scanX >> 5 && regionZ == scanZ >> 5) {
+                                            regionData.computeIfAbsent(new ChunkPos(scanX, scanZ), create -> new ByteArrayOutputStream()).write(stream.toByteArray());
+                                        }
+                                    }
+                                }
+                            } catch (Exception exception) {
+                                OutsideUtils.exception(new Exception(), exception, "");
+                                break;
+                            }
+                        }
+                    }
+                    return regionData;
+                })
+            );
+
+            // 核心妥协：如果 Future 还没完成，当前线程绝对不等待，直接返回空数据放弃本次生成。
+            // 依靠 TreeLocation 中的 +-4 Chunk 偏移重复生成逻辑来补偿漏掉的树木。
+            if (future.isDone()) {
+                try {
+                    Map<ChunkPos, ByteArrayOutputStream> data = future.get();
+                    ByteArrayOutputStream stream = data.get(chunk_pos);
+                    if (stream == null) {
+                        return ByteBuffer.allocate(0);
+                    } else {
+                        return ByteBuffer.wrap(stream.toByteArray());
+                    }
+                } catch (Exception e) {
+                    return ByteBuffer.allocate(0);
+                }
+            } else {
+                return ByteBuffer.allocate(0);
+            }
+        }
+
+    }
+    private static class DetailedDetection {
+
+        // [方向A重构] 废除 memoryCache：中心 chunk 检测确保每棵树只被处理一次，无需跨 chunk 缓存
+
+        private static void test (LevelAccessor level_accessor, ServerLevel level_server, ChunkGenerator chunk_generator, String dimension, ChunkPos chunk_pos, int from_chunkX, int from_chunkZ, int to_chunkX, int to_chunkZ, String id, String chosen, int centerX, int centerZ) {
+
+            // [方向A重构] 中心 chunk 检测：只有树中心所在的 chunk 才执行检测和分发，其余 chunk 直接返回
+            if (chunk_pos.x != centerX >> 4 || chunk_pos.z != centerZ >> 4) {
+                return;
+            }
+
+            // [LMax Debug] 追踪每棵树的放置
+            long tree_start = System.currentTimeMillis();
+            if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DetailedDetection: placing tree '" + id + "' at " + centerX + "," + centerZ + " in chunk " + chunk_pos);
+            String location = "";
+            String path_settings = "";
+            String ground_block = "";
+            String[] start_height_offset = null;
+
+            // Get Config Data
+            {
+
+                Map<String, String> config = ConfigDynamic.getData("world_gen").get(id);
+
+                if (config == null) {
+
+                    return;
+
+                }
+
+                location = config.get("path_storage") + "|" + chosen;
+                path_settings = config.get("path_settings");
+                ground_block = config.get("ground_block");
+                start_height_offset = config.get("start_height_offset").split(" <> ");
+
+            }
+
+            int dead_tree_level = TreeLocation.getDeadTreeLevel(level_accessor, id, location, centerX, centerZ, false);
+            int fallen_direction = 0;
+
+            if (dead_tree_level > 200) {
+
+                fallen_direction = TreeLocation.getFallenDirection(level_accessor, centerX, centerZ);
+
+            }
+
+            int[] rotation_mirrored = TreeLocation.getRotationMirrored(level_accessor, centerX, centerZ, id);
+
+            if (rotation_mirrored == null) {
+                // [LMax Debug V50.2 刀H] R2 = rotation null 退出点 (探针复活: 原行传输事故合并为注释)
+                if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-R2 rotation-null id=" + id + " at " + centerX + "," + centerZ);
+
+                return;
+
+            }
+
+            BlockPos pos_center = new BlockPos(centerX, 0, centerZ);
+            boolean pass = false;
+
+            // [方向A重构] 废除 memoryCache：中心 chunk 检测确保每棵树只被处理一次
+            {
+
+                String type = "";
+                int start_height = 0;
+
+                // Scan Tree Settings
+                {
+
+                    Map<String, String> tree_settings = Caches.TreeSettings.getNormal(path_settings);
+                    type = tree_settings.getOrDefault("type", "");
+                    start_height = Integer.parseInt(tree_settings.getOrDefault("start_height", "0"));
+
+                }
+
+                test:
+                {
+                    // [LMax Debug] 检查点：高度查询前
+                    if (Core.log_place_calculate) System.out.println("[THT-DEBUG] CP1: before getHeightWorldGen for '" + id + "' at " + centerX + "," + centerZ);
+                    BlockPos pos_original = new BlockPos(centerX, GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, centerX, centerZ, "OCEAN_FLOOR_WG", "OCEAN_FLOOR_WG"), centerZ);
+                    if (Core.log_place_calculate) System.out.println("[THT-DEBUG] CP2: after getHeightWorldGen, Y=" + pos_original.getY());
+
+                    // Ground Level
+                    {
+
+                        if (GameUtils.Space.testChunkStatus(level_accessor, new ChunkPos(pos_original), "carvers") == true) {
+
+                            BlockState block = level_accessor.getBlockState(pos_original.below());
+
+                            if (block.canBeReplaced() == true) {
+
+                                // [LMax Debug V50.2 刀H] [长期记忆: 098] 滤网尸检遥测: E1-E11 = test:块内11个break退出点按文件序编号,
+                                // 零行为改动, log_place_calculate 门控; 一次测试得死亡直方图后精准补刀 (探针复活: 原行传输事故合并为注释)
+                                if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E1 id=" + id + " at " + centerX + "," + centerZ + " block=" + block);
+                                break test;
+
+                            } else if (GameUtils.Tile.test(block, ground_block) == false) {
+
+                                if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E2 id=" + id + " at " + centerX + "," + centerZ + " ground=" + block + " want=" + ground_block);
+                                break test;
+
+                            }
+
+                        }
+
+                    }
+
+                    RandomSource random = RandomSource.create(level_accessor.getServer().overworld().getSeed() ^ ((centerX * 341873128712L) + (centerZ * 132897987541L)));
+
+                    // Tree Type
+                    {
+
+                        if (type.equals("special") == false && type.equals("emergent") == false) {
+
+                            int highestY = GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, centerX, centerZ, "WORLD_SURFACE_WG", "WORLD_SURFACE_WG");
+
+        
+
+          
+                            // [P0-2 修复] 使用可配置高度容差，避免超平坦世界中 getBaseHeight 噪声导致 1 格偏差时 terrestrial 树被误判为 unviable ecology
+                            if ((type.equals("terrestrial") == true && (pos_original.getY() < highestY - Handcode.Config.unviable_ecology_height_tolerance)) || (type.equals("aquatic") == true && (pos_original.getY() == highestY))) {
+
+                                if (random.nextDouble() < Handcode.Config.unviable_ecology_skip_chance) {
+
+                                    if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E3 id=" + id + " at " + centerX + "," + centerZ + " y=" + pos_original.getY() + " highestY=" + highestY);
+                                    break test;
+
+                                }
+
+                                if (dead_tree_level == 0) {
+
+                                    dead_tree_level = TreeLocation.getDeadTreeLevel(level_accessor, id, location, centerX, centerZ, true);
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    // Height Offset
+                    {
+
+                        int offsetY = pos_original.getY() + start_height;
+
+                        if (dead_tree_level < 200) {
+
+                            offsetY = offsetY + random.nextInt(Integer.parseInt(start_height_offset[0]), Integer.parseInt(start_height_offset[1]) + 1);
+
+                        }
+
+                        pos_center = pos_center.atY(pos_center.getY() + offsetY);
+
+                    }
+
+                    int center_sizeX = 0;
+                    int center_sizeY = 0;
+                    int center_sizeZ = 0;
+                    int sizeX = 0;
+                    int sizeY = 0;
+                    int sizeZ = 0;
+
+                    // Get Size
+                    {
+
+                        try {
+
+                            short[] size_data = Caches.TreeShape.getTreeShapeSize(location);
+                            if (size_data == null || size_data.length < 6) {
+                                // [MODS-CONFIG] 限流: 同一个损坏条目每 30 秒只打一次
+                                LogLimiter.error("shape_corrupt:" + location, "[THT] Tree shape data is missing or corrupted: " + location, null);
+                                if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E4 id=" + id + " at " + centerX + "," + centerZ);
+                                break test;
+                            }
+                            sizeX = size_data[0];
+                            sizeY = size_data[1];
+                            sizeZ = size_data[2];
+                            center_sizeX = size_data[3];
+                            center_sizeY = size_data[4];
+                            center_sizeZ = size_data[5];
+
+                        } catch (Exception exception) {
+
+                            OutsideUtils.exception(new Exception(), exception, "This is normal error when a tree shape is no longer in your world. Here is that shape ID [ " + location + " ].");
+                            if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E5 id=" + id + " at " + centerX + "," + centerZ);
+                            break test;
+
+                        }
+                    }
+
+                    // Size Convert
+                    {
+
+                        int[] convert = OutsideUtils.convertSizeRotationMirrored(rotation_mirrored, sizeX, sizeZ, center_sizeX, center_sizeZ);
+                        sizeX = convert[0];
+                        sizeZ = convert[1];
+                        center_sizeX = convert[2];
+                        center_sizeZ = convert[3];
+
+                        if (fallen_direction > 0) {
+
+                            convert = OutsideUtils.convertSizeFallen(fallen_direction, sizeX, sizeY, sizeZ, center_sizeX, center_sizeY, center_sizeZ);
+                            sizeX = convert[0];
+                            sizeY = convert[1];
+                            sizeZ = convert[2];
+                            center_sizeX = convert[3];
+                            center_sizeY = convert[4];
+                            center_sizeZ = convert[5];
+
+                        }
+
+                    }
+
+                    // Height Y Test
+                    {
+
+                        if ((sizeY - center_sizeY) + pos_center.getY() >= level_accessor.getMaxBuildHeight()) {
+
+                            if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E6 id=" + id + " at " + centerX + "," + centerZ + " y=" + pos_center.getY() + " sizeY=" + sizeY);
+                            break test;
+
+                        }
+
+                        if (pos_original.getY() == GameUtils.Space.getBuildHeight(level_accessor, false)) {
+
+                            if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E7 id=" + id + " at " + centerX + "," + centerZ + " y=" + pos_original.getY());
+                            break test;
+
+                        }
+
+                        if (Handcode.Config.max_height_spawn != 0) {
+
+                            if (pos_original.getY() > Handcode.Config.max_height_spawn) {
+
+                                if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E8 id=" + id + " at " + centerX + "," + centerZ + " y=" + pos_original.getY() + " cap=" + Handcode.Config.max_height_spawn);
+                                break test;
+
+                            }
+
+                        }
+
+                    }
+
+                    // Structure Detection
+                    {
+
+                        int size = Handcode.Config.structure_detection_size;
+                        ChunkPos chunk_pos_test = null;
+
+                        if (size >= 0) {
+
+        
+
+          
+                            Map<Structure, LongSet> references = new HashMap<>();
+                            // [P2 修复] 限制扫描 chunk 数量，防止大范围扫描导致卡顿
+                            int chunk_scan_count = 0;
+                            boolean chunk_scan_limit_reached = false;
+
+                            for (int scanX = from_chunkX - size; scanX <= to_chunkX + size; scanX++) {
+
+                                if (chunk_scan_limit_reached) {
+
+                                    break;
+
+                                }
+
+                                for (int scanZ = from_chunkZ - size; scanZ <= to_chunkZ + size; scanZ++) {
+
+                                    // [P2 修复] 超过最大扫描数量时停止，避免大范围扫描卡顿
+                                    if (chunk_scan_count >= Handcode.Config.structure_detection_max_chunks) {
+
+                                        chunk_scan_limit_reached = true;
+                                        break;
+
+                                    }
+
+                                    chunk_scan_count = chunk_scan_count + 1;
+                                    chunk_pos_test = new ChunkPos(scanX, scanZ);
+
+                                    if (GameUtils.Space.testChunkStatus(level_accessor, chunk_pos_test, "structure_references") == true) {
+
+                                        references = level_accessor.getChunk(chunk_pos_test.x, chunk_pos_test.z).getAllReferences();
+
+                                        if (references.size() > 0) {
+
+                                            for (Structure structure : references.keySet()) {
+
+                                                if (structure.step() == GenerationStep.Decoration.SURFACE_STRUCTURES) {
+
+                                                    if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E9 id=" + id + " at " + centerX + "," + centerZ);
+                                                    break test;
+
+                                                }
+
+                                            }
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                    if (sizeX != 0 || sizeZ != 0) {
+
+                        if (testSurfaceSmoothness(level_accessor, level_server, chunk_generator, pos_center, sizeX, sizeY, sizeZ, center_sizeX, center_sizeY, center_sizeZ, pos_original) == false) {
+
+                            if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E10 id=" + id + " at " + centerX + "," + centerZ);
+                            break test;
+
+                        }
+
+                        if (dead_tree_level > 200) {
+
+                            if (testFallenArea(level_accessor, level_server, chunk_generator, location, pos_center, rotation_mirrored, fallen_direction, dead_tree_level) == false) {
+
+                                if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-REJECT-E11 id=" + id + " at " + centerX + "," + centerZ);
+                                break test;
+
+                            }
+
+                        }
+
+                    }
+
+                    pass = true;
+                    // [LMax Debug V50.2 刀H] PASS = 通过全部检测进入 placeCalculate (存活计数, 与E1-E11+R2构成会计闭环) (探针复活)
+                    if (Core.log_place_calculate) System.out.println("[THT-DEBUG] DD-PASS id=" + id + " at " + centerX + "," + centerZ + " y=" + pos_center.getY());
+
+                }
+
+            }
+
+        
+
+          
+            if (pass == true) {
+
+                // [LMax Debug] 追踪 placeCalculate 耗时
+                long pc_start = System.currentTimeMillis();
+                // [方向A重构] 调用 placeCalculate() 替代旧 place()
+                placeCalculate(level_accessor, level_server, chunk_pos, id, location, path_settings, pos_center, rotation_mirrored, dead_tree_level, fallen_direction);
+                long pc_time = System.currentTimeMillis() - pc_start;
+                if (pc_time > 50) {
+                    if (Core.log_place_calculate) System.out.println("[THT-DEBUG] placeCalculate '" + id + "' at " + centerX + "," + centerZ + " took " + pc_time + "ms");
+                }
+
+                // [LMax Fix V16] 修复死锁：level_server.getChunk() 会阻塞等待目标区块 FULL，
+                // 在多线程区块生成中，两个区块互相等对方 FULL 导致永久死锁。
+                // 修复：全部走 DeferredQueue，不在生成期间直接访问邻近区块。
+                for (int scanX = from_chunkX; scanX <= to_chunkX; scanX++) {
+                    for (int scanZ = from_chunkZ; scanZ <= to_chunkZ; scanZ++) {
+
+                        ChunkPos target_cp = new ChunkPos(scanX, scanZ);
+
+                        if (target_cp.equals(chunk_pos)) {
+                            continue;
+                        }
+
+                        DeferredQueue.addForced(dimension, level_server.dimension(), chunk_pos, target_cp); // [LMax Fix V40] 传递维度key修复串黑洞 [长期记忆: 010]
+
+                    }
+                }
+
+            }
+
+        }
+
+        private static boolean testSurfaceSmoothness (LevelAccessor level_accessor, ServerLevel level_server, ChunkGenerator chunk_generator, BlockPos pos_center, int sizeX, int sizeY, int sizeZ, int center_sizeX, int center_sizeY, int center_sizeZ, BlockPos pos_original) {
+
+            if (Handcode.Config.surface_smoothness_detection == true) {
+
+                int test_sizeX = sizeX - center_sizeX;
+                int test_sizeZ = sizeZ - center_sizeZ;
+                int test_center_sizeX = center_sizeX;
+                int test_center_sizeZ = center_sizeZ;
+
+                int pos1 = GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, pos_center.getX() - test_center_sizeX, pos_center.getZ() - test_center_sizeZ, "OCEAN_FLOOR", "OCEAN_FLOOR_WG");
+                int pos2 = GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, pos_center.getX() - test_center_sizeX, pos_center.getZ() + test_sizeZ, "OCEAN_FLOOR", "OCEAN_FLOOR_WG");
+                int pos3 = GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, pos_center.getX() + test_sizeX, pos_center.getZ() - test_center_sizeZ, "OCEAN_FLOOR", "OCEAN_FLOOR_WG");
+                int pos4 = GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, pos_center.getX() + test_sizeX, pos_center.getZ() + test_sizeZ, "OCEAN_FLOOR", "OCEAN_FLOOR_WG");
+
+                int height_up = (sizeY - center_sizeY) + Math.abs(pos_center.getY() - pos_original.getY());
+                height_up = pos_original.getY() + (int) Math.ceil(height_up * Handcode.Config.surface_smoothness_detection_height_up * 0.01);
+                int height_down = center_sizeY + Math.abs(pos_center.getY() - pos_original.getY());
+                height_down = pos_original.getY() - (int) Math.ceil(height_down * Handcode.Config.surface_smoothness_detection_height_down * 0.01);
+                boolean test1 = (pos_original.getY() < pos1 && height_up > pos1) || (pos_original.getY() >= pos1 && pos1 > height_down);
+                boolean test2 = (pos_original.getY() < pos2 && height_up > pos2) || (pos_original.getY() >= pos2 && pos2 > height_down);
+                boolean test3 = (pos_original.getY() < pos3 && height_up > pos3) || (pos_original.getY() >= pos3 && pos3 > height_down);
+                boolean test4 = (pos_original.getY() < pos4 && height_up > pos4) || (pos_original.getY() >= pos4 && pos4 > height_down);
+
+                return test1 == true && test2 == true && test3 == true && test4 == true;
+
+            }
+
+            return true;
+
+        }
+
+        private static boolean testFallenArea (LevelAccessor level_accessor, ServerLevel level_server, ChunkGenerator chunk_generator, String location, BlockPos pos_center, int[] rotation_mirrored, int fallen_direction, int dead_tree_level) {
+
+            int reduce_trunk = 0;
+            int reduce_bough = 0;
+            int reduce_branch = 0;
+            int reduce_limb = 0;
+            int reduce_twig = 0;
+            int reduce_sprig = 0;
+
+            // Get Reduce
+            {
+
+                try {
+
+                    int[] data = getPartReduce(level_accessor, location, pos_center.getX(), pos_center.getZ(), dead_tree_level);
+                    reduce_trunk = data[0];
+                    reduce_bough = data[1];
+                    reduce_branch = data[2];
+                    reduce_limb = data[3];
+                    reduce_twig = data[4];
+                    reduce_sprig = data[5];
+
+                } catch (Exception exception) {
+
+                    OutsideUtils.exception(new Exception(), exception, "");
+                    return false;
+
+                }
+
+            }
+
+            int left_before_test = 0;
+
+            // Get Left
+            {
+
+                double total = reduce_trunk + reduce_bough + reduce_branch + reduce_limb + reduce_twig + reduce_sprig;
+                left_before_test = (int) Math.ceil(total * 0.5);
+
+            }
+
+            boolean is_only_trunk = dead_tree_level >= 60;
+            int distance_skip = (int) Math.floor(left_before_test / 16.0);
+        
+
+          
+            int distance_skip_test = 0;
+            // [P1 修复] 高度检查计数器，用于限制 getHeightWorldGen 调用次数
+            int height_check_count = 0;
+            BlockPos pos = null;
+
+            int loop = 0;
+            short type = 0;
+            short posX = 0;
+            short posY = 0;
+            short posZ = 0;
+
+            for (short scan : Caches.TreeShape.getTreeShapeData(location)) {
+
+                // Get Data
+                {
+
+                    loop = loop + 1;
+
+                    if (loop == 1) {
+
+                        type = scan;
+
+                    } else if (loop == 2) {
+
+                        posX = scan;
+
+                    } else if (loop == 3) {
+
+                        posY = scan;
+
+                    } else {
+
+                        posZ = scan;
+                        loop = 0;
+
+                    }
+
+                }
+
+                if (loop == 0) {
+
+                    if (OutsideUtils.Mathematics.isNumberStartWith(type, 1) == true) {
+
+                        // Skip Roots
+                        {
+
+                            if (OutsideUtils.Mathematics.isNumberStartWith(type, 110) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 111) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 112) == true || OutsideUtils.Mathematics.isNumberStartWith(type, 113) == true) {
+
+                                continue;
+
+                            }
+
+                        }
+
+                        // Dead Tree Reduction
+                        {
+
+                            // Basic Style
+                            {
+
+                                if (OutsideUtils.Mathematics.isNumberStartWith(type, 120) == true) {
+
+                                    continue;
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 119) == true) {
+
+                                    if (reduce_sprig > 0) {
+
+                                        reduce_sprig = reduce_sprig - 1;
+
+                                    } else {
+
+                                        continue;
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 118) == true) {
+
+                                    if (reduce_sprig == 0) {
+
+                                        if (reduce_twig > 0) {
+
+                                            reduce_twig = reduce_twig - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 117) == true) {
+
+                                    if (reduce_twig == 0) {
+
+                                        if (reduce_limb > 0) {
+
+                                            reduce_limb = reduce_limb - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 116) == true) {
+
+                                    if (reduce_limb == 0) {
+
+                                        if (reduce_branch > 0) {
+
+                                            reduce_branch = reduce_branch - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                } else if (OutsideUtils.Mathematics.isNumberStartWith(type, 115) == true) {
+
+                                    if (reduce_branch == 0) {
+
+                                        if (reduce_bough > 0) {
+
+                                            reduce_bough = reduce_bough - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                            if (is_only_trunk == true) {
+
+                                // Only Trunk
+                                {
+
+                                    if (OutsideUtils.Mathematics.isNumberStartWith(type, 114) == true) {
+
+                                        if (reduce_trunk > 0) {
+
+                                            reduce_trunk = reduce_trunk - 1;
+
+                                        } else {
+
+                                            continue;
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                        if (left_before_test > 0) {
+
+                            left_before_test = left_before_test - 1;
+
+                        } else {
+
+                            // Distance Skip
+                            {
+
+                                if (distance_skip > 0) {
+
+                                    if (distance_skip_test > 0) {
+
+                                        distance_skip_test = distance_skip_test - 1;
+                                        continue;
+
+                                    } else {
+
+                                        distance_skip_test = distance_skip;
+
+                                    }
+
+                                }
+
+                            }
+
+        
+
+          
+                            pos = new BlockPos(posX, posY, posZ);
+                            pos = OutsideUtils.convertPosRotationMirrored(pos, rotation_mirrored);
+                            pos = OutsideUtils.convertPosFallen(pos, fallen_direction);
+                            pos = pos.offset(pos_center.getX(), pos_center.getY(), pos_center.getZ());
+
+                            // [P1 修复] 超过最大高度检查次数时停止检测，避免大树形状导致大量噪声计算卡顿
+                            if (height_check_count >= Handcode.Config.test_fallen_area_max_height_checks) {
+
+                                return false;
+
+                            }
+
+                            height_check_count = height_check_count + 1;
+
+                            if (pos.getY() <= GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, pos.getX(), pos.getZ(), "OCEAN_FLOOR_WG", "OCEAN_FLOOR_WG")) {
+
+                                return true;
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            return false;
+
+        }
+
+    }
+
+    private static class LeafLitterGeneration {
+
+        // [LMax Fix V7] 替换为线程安全容器，解决 ForkJoinPool 并发修改异常
+        private static final Map<ChunkPos, Map<BlockPos, BlockState>> cache_locations = new java.util.concurrent.ConcurrentHashMap<>();
+
+        private static void add (ChunkPos chunk_pos, BlockPos pos, BlockState block) {
+            cache_locations.computeIfAbsent(chunk_pos, create -> new java.util.concurrent.ConcurrentHashMap<>()).put(pos, block);
+        }
+
+        private static void  place (LevelAccessor level_accessor, ServerLevel level_server, ChunkGenerator chunk_generator, ChunkPos chunk_pos) {
+
+            {
+
+                // [LMax Fix V55 刀T] get+remove 双步改 remove 原子取走（DeferredBlocks.take 同构）：刀T 后 place 存在                 // 双消费方（Server-thread start 尾段 / processTick FORCED 冲刷），get→处理→remove 窗口内另一消费方                 // 并发进入 = 同一落叶集双放置。前置 remove 原子互斥，后到者取 null 零操作退出。
+                Map<BlockPos, BlockState> data = cache_locations.remove(chunk_pos);
+
+                if (data == null) {
+
+                    return;
+
+                }
+
+                int height_motion = 0;
+
+                for (Map.Entry<BlockPos, BlockState> entry : data.entrySet()) {
+
+                    height_motion = GameUtils.Space.getHeightWorldGen(level_accessor, level_server, chunk_generator, entry.getKey().getX(), entry.getKey().getZ(), "MOTION_BLOCKING_NO_LEAVES", "WORLD_SURFACE_WG");
+
+                    if (height_motion < entry.getKey().getY()) {
+
+                        LeafLitter.create(level_accessor, level_server, entry.getKey().atY(height_motion), entry.getValue(), false);
+
+                    }
+
+                }
+
+                // [LMax Fix V55 刀T] 原尾部 remove 行退役：place 入口已改原子取走（下方 get→remove 前置），双消费方互斥
+
+            }
+
+        }
+
+    }
+
+    // [方向A重构] 新增 PendingBlocks 类：按 chunk 分组缓存方块，解决跨 chunk 写入时序问题
+    // [LMax Fix V50.4 刀N] flushPendingBlocks 退役：唯一调用方（EventCenter 重载冲刷 else 分支）已改 DQ forced
+    // 主线程消费，本方法零引用收尸。冲刷语义由 processTick → PendingBlocks.placeForced 全量接管。
+
+    private static class PendingBlocks {
+
+        // [LMax Fix V49 刀B2] [长期记忆: 078/086] 字段退役：cache_blocks / add_count 已迁 core 层 DeferredBlocks
+        // （同款 ConcurrentHashMap 语义 + V39 诊断计数，GameUtils.Tile.set 与本类共用，行为零漂移）
+
+        // 添加方块到缓存（按方块所在 chunk 分组）
+        // [LMax Fix V49 刀B2] [长期记忆: 078/086] 薄转发至 core 层 DeferredBlocks：容器原语上移
+        // （GameUtils.Tile.set 未加载分支与 handcode 冲刷共用同一缓存，避免 core→handcode 反向依赖；
+        // V39 诊断计数与日志措辞随容器迁移，保持日志判读连续）
+        private static void add (BlockPos pos, BlockState block) {
+            tannyjung.tanshugetrees_core.game.DeferredBlocks.add(pos, block);
+        }
+
+        // 从缓存中拉取并写入指定 chunk 的所有方块（由各 chunk 的 start() 调用）
+        private static int place (LevelAccessor level_accessor, ChunkPos chunk_pos) { // [LMax Fix V42] 返回实际落块数
+
+            // [LMax Fix V49 刀B2] get+remove 双步改 DeferredBlocks.take 原子取走 [长期记忆: 078/086]
+            // （顺修丢块窗口：旧写循环与 remove 之间并发 add 的块会被连带 remove 吞掉；take 原子取走后，
+            // 期间新到的 add 进新容器留存缓存，等下一次冲刷——严格零丢失）
+            Map<BlockPos, BlockState> data = tannyjung.tanshugetrees_core.game.DeferredBlocks.take(chunk_pos);
+
+            // [LMax Debug V39] 诊断：place()调用时缓存状态
+            if (Core.log_pending_blocks) {
+                int dataSize = (data == null) ? 0 : data.size();
+                // [LMax Fix V53 刀R预备] 补键控守卫: 此前零守卫每chunk必打, 烟测09-20判例(THT-DEBUG=全日志93%), 归入pending_blocks域 [长期记忆: 015]
+                if (Core.log_pending_blocks) System.out.println("[THT-DEBUG] PendingBlocks.place() chunk " + chunk_pos + " cache: " + (data == null ? "NULL" : dataSize + " blocks") + " | total cache chunks: " + tannyjung.tanshugetrees_core.game.DeferredBlocks.size());
+            }
+
+            if (data == null) {
+            return 0; // [LMax Fix V42] 无缓存数据，未落任何块
+            }
+
+            int placed = 0;
+            for (Map.Entry<BlockPos, BlockState> entry : data.entrySet()) {
+
+                GameUtils.Tile.set(level_accessor, entry.getKey(), entry.getValue());
+                placed++;
+
+            }
+
+            // [LMax Debug V39] 诊断：实际写入方块数
+            if (Core.log_pending_blocks) System.out.println("[THT-DEBUG] PendingBlocks.place() chunk " + chunk_pos + " placed: " + placed + " blocks");
+
+            // [LMax Fix V49 刀B2] 缓存已在 take 时原子取走（原"写入完成后清除"的 remove 行退役）
+            return placed; // [LMax Fix V42] 返回实际落块数供 resync 判定
+        }
+
+        // [方向A重构] 强制补写方法：用于 DeferredQueue 补写已 FULL 的 chunk
+        private static int placeForced (ServerLevel level_server, ChunkPos chunk_pos) { // [LMax Fix V42] 返回实际落块数
+
+            // [LMax Fix V49 刀B2] get+remove 双步改 DeferredBlocks.take 原子取走 [长期记忆: 078/086]
+            // （顺修丢块窗口：旧写循环与 remove 之间并发 add 的块会被连带吞掉；take 后新块留新容器下轮冲刷）
+            Map<BlockPos, BlockState> data = tannyjung.tanshugetrees_core.game.DeferredBlocks.take(chunk_pos);
+
+            // [LMax Debug V40] placeForced 诊断日志
+            if (Core.log_pending_blocks) System.out.println("[THT-DEBUG] placeForced() chunk " + chunk_pos + " cache: " + (data == null ? "NULL" : data.size() + " blocks"));
+
+            if (data == null) {
+            return 0; // [LMax Fix V42] 无缓存数据，未落任何块
+            }
+
+            int placed_count = 0;
+            for (Map.Entry<BlockPos, BlockState> entry : data.entrySet()) {
+
+                // [LMax Fix V50.3 刀L] [长期记忆: 113/114] flags 4→2：bit2 客户端 section 级增量同步 + 光照增量，
+                // 无 bit1 邻居更新。旧 flag=4 不广播 → 后置补写方块对已持 chunk 的玩家永久不可见（幽灵方块案）。
+                level_server.setBlock(entry.getKey(), entry.getValue(), 2);
+                placed_count++;
+
+            }
+
+            // [LMax Fix V49 刀B2] 缓存已在 take 时原子取走（原 remove 行退役）
+            // [LMax Debug V40] placeForced 完成日志
+            if (Core.log_pending_blocks) System.out.println("[THT-DEBUG] placeForced() chunk " + chunk_pos + " placed: " + placed_count + " blocks, cache cleared");
+
+            return placed_count; // [LMax Fix V42] 返回实际落块数供 resync 判定
+        }
+
+    }
+
+    private static class Function {
+
+        // [LMax Fix V7] 替换为线程安全容器，解决 ForkJoinPool 并发修改异常
+        private static final Map<ChunkPos, Map<BlockPos, List<String>>> cache_functions = new java.util.concurrent.ConcurrentHashMap<>();
+
+        private static void add (ChunkPos chunk_pos, BlockPos pos, String path) {
+            cache_functions.computeIfAbsent(chunk_pos, create -> new java.util.concurrent.ConcurrentHashMap<>())
+                           .computeIfAbsent(pos, create -> new java.util.concurrent.CopyOnWriteArrayList<>())
+                           .add(path);
+        }
+
+        private static void run (LevelAccessor level_accessor, ServerLevel level_server, ChunkPos chunk_pos) {
+
+            {
+
+                Map<BlockPos, List<String>> data = cache_functions.get(chunk_pos);
+
+                if (data == null) {
+
+                    return;
+
+                }
+
+                for (Map.Entry<BlockPos, List<String>> entry : data.entrySet()) {
+
+                    for (String get : entry.getValue()) {
+
+                        TXTFunction.run(level_accessor, level_server, entry.getKey(), get, false);
+
+                    }
+
+                }
+
+                cache_functions.remove(chunk_pos);
+
+            }
+
+        }
+
+    }
+
+}

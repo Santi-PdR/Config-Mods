@@ -1,0 +1,795 @@
+package tannyjung.tanshugetrees_core.outside;
+
+import net.minecraft.server.level.ServerLevel;
+import tannyjung.tanshugetrees_core.Core;
+import tannyjung.tanshugetrees_core.game.GameUtils;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.*;
+
+public class CustomPackOrganizing {
+
+    private static final Map<String, String> cache_pack_ids = new HashMap<>();
+    private static final Set<String> cache_error_files = new HashSet<>();
+    private static final Map<String, Map<String, Set<String>>> errors = new HashMap<>();
+
+    public static void start (ServerLevel level_server, String pack_separate_multiple, String folder_settings, String folder_functions) {
+
+        errors.clear();
+
+        FileManager.delete(Core.path_config + "/dev/temporary");
+        FileManager.createEmptyFile(Core.path_config + "/dev/temporary", true);
+
+        // Rename All Back
+        {
+
+            File[] packs = new File(Core.path_config + "/custom_packs").listFiles();
+
+            if (packs == null) {
+
+                return;
+
+            }
+
+            for (File pack : packs) {
+
+                FileManager.rename(pack.getPath(), pack.getName().replace("[INCOMPATIBLE] ", ""));
+
+            }
+
+        }
+
+        // Extract ZIP
+        {
+
+            File[] packs = new File(Core.path_config + "/custom_packs").listFiles();
+
+            if (packs == null) {
+
+                return;
+
+            }
+
+            for (File pack : packs) {
+
+                if (pack.getName().endsWith(".zip") == true) {
+
+                    FileManager.extractZIP(pack.getPath(), Core.path_config + "/dev/temporary/pack_zip/" + pack.getName(), false, "");
+
+                }
+
+            }
+
+        }
+
+        organizeInfo();
+
+        // Organizing Data
+        {
+
+            File[] packs = new File(Core.path_config + "/custom_packs").listFiles();
+
+            if (packs == null) {
+
+                return;
+
+            }
+
+            pack_separate_multiple = " / " + pack_separate_multiple + " / ";
+        
+
+          
+            pack_separate_multiple = " / " + pack_separate_multiple + " / ";
+            File main_pack = TannyPackManager.getCurrentFile();
+            if (Core.debug_log) System.out.println("[THT-DEBUG] CustomPackOrganizing main_pack: " + (main_pack != null ? main_pack.getPath() : "null") + ", exists: " + (main_pack != null && main_pack.exists()));
+            if (Core.debug_log) System.out.println("[THT-DEBUG] CustomPackOrganizing custom_packs count: " + (packs != null ? packs.length : 0));
+
+            if (main_pack.exists() == true) {
+
+                organize(main_pack, pack_separate_multiple);
+
+            }
+
+            for (File pack : packs) {
+
+                if (pack.getName().equals(main_pack.getName()) == false) {
+
+                    organize(pack, pack_separate_multiple);
+
+                }
+
+            }
+
+        }
+
+        // Edit
+        {
+
+            File file = new File(Core.path_config + "/dev/temporary/edit");
+
+            if (file.exists() == true) {
+
+                for (File scan : FileManager.getAllFiles(file.getPath())) {
+
+                    {
+
+                        Path path_to = file.toPath().relativize(scan.toPath());
+                        path_to = Path.of(Core.path_config + "/dev/temporary").resolve(path_to);
+
+                        if (path_to.toFile().exists() == true) {
+
+                            // Edit
+                            {
+
+                                if (scan.getName().endsWith(".txt") == true) {
+
+                                    FileManager.mergeTXT(scan, path_to.toFile());
+
+                                } else {
+
+                                    FileManager.copy(scan.getPath(), path_to.toString(), false);
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
+
+        test(level_server, folder_settings, false);
+        test(level_server, folder_functions, true);
+        FileManager.delete(Core.path_config + "/dev/temporary/pack_zip");
+
+        // Rename Incompatible Files
+        {
+
+            for (String scan : cache_error_files) {
+
+                FileManager.rename(scan, "[INCOMPATIBLE] " + new File(scan).getName());
+
+            }
+
+        }
+
+        cache_pack_ids.clear();
+        cache_error_files.clear();
+
+    }
+
+    private static void organizeInfo () {
+
+        File[] packs = new File(Core.path_config + "/custom_packs").listFiles();
+
+        if (packs == null) {
+
+            return;
+
+        }
+
+        Map<String, String> locations = new HashMap<>();
+        // 缓存：pack_id -> File 对象（用于依赖检查，快速通过 ID 查找包）
+        Map<String, File> cache_pack_files = new HashMap<>();
+
+        // Get Location
+        {
+
+            File file = null;
+
+            for (File pack : packs) {
+
+                if (pack.getName().endsWith(".zip") == true) {
+
+                    file = new File(Core.path_config + "/dev/temporary/pack_zip/" + pack.getName() + "/info.txt");
+
+                } else {
+
+                    file = new File(pack.getPath() + "/info.txt");
+
+                }
+
+                if (file.exists() == true) {
+
+                    FileManager.copy(file.getPath(), Core.path_config + "/dev/temporary/info/" + pack.getName() + ".txt", false);
+                    locations.put(pack.getName(), file.getPath());
+
+                }
+
+            }
+
+        }
+
+        // Get Pack ID
+        // 填充两个缓存：
+        // 1. cache_pack_files: pack_id -> File (用于依赖检查，通过 ID 查找包)
+        // 2. cache_pack_ids: 文件名 -> pack_id (用于从文件名获取 ID，保持原有逻辑)
+        {
+
+            for (Map.Entry<String, String> entry : locations.entrySet()) {
+
+                String fileName = entry.getKey();
+                String filePath = entry.getValue();
+                Map<String, String> data = OutsideUtils.convertFileToDataMap(filePath);
+                String packId = data != null ? data.get("pack_id") : null;
+                
+                // 只有当 pack_id 不为空时才注册
+                if (packId != null && !packId.isEmpty()) {
+                    // 构建完整的 File 对象
+                    File packFile = new File(filePath).getParentFile().toPath().resolve(fileName).toFile();
+                    
+                    // 注册到两个缓存
+                    cache_pack_files.put(packId, packFile);
+                    cache_pack_ids.put(fileName, packId);
+                }
+
+            }
+
+        }
+
+        boolean pass = false;
+        Map<String, String> data = null;
+        String location = "";
+        String pack_id = "";
+        String data_structure_version = "";
+        String required_packs = "";
+        String required_mods = "";
+        Map<String, List<Integer>> test_duplicated_pack = new HashMap<>();
+
+        for (File pack : packs) {
+
+            pass = true;
+            location = locations.get(pack.getName());
+
+            if (location == null) {
+
+                Error.add("pack", "packs / info file not found. This will results skipping these packs. Make sure you use the version that includes info file.", pack.getPath(), pack.getName());
+                pass = false;
+                // 修复: 当找不到 info 文件时，给 data 赋空 Map，防止后续 data.get() 抛出 NPE，并让后续检查自然失败
+                data = new HashMap<>();
+
+            } else {
+
+                data = OutsideUtils.convertFileToDataMap(location);
+
+            }
+
+            // Pack ID
+            {
+
+                pack_id = cache_pack_ids.get(pack.getName());
+
+                if (pack_id == null) {
+
+                    Error.add("pack", "packs / pack ID not found. This will results skipping these packs. Make sure you use the version that includes pack ID.", pack.getPath(), pack.getName());
+                    pass = false;
+
+                } else {
+
+                    test_duplicated_pack.computeIfAbsent(pack_id, create -> new ArrayList<>()).add(1);
+
+                    if (test_duplicated_pack.get(pack_id).size() > 1) {
+
+                        Error.add("pack", "packs / duplicated pack IDs. This will results skipping these packs. You can report this to the pack authors to help them fix it.", pack.getPath(), pack.getName() + " > " + pack_id);
+                        pass = false;
+
+                        cache_pack_ids.replace(pack.getName(), pack_id + "_" + test_duplicated_pack.get(pack_id).size());
+
+                    }
+
+                }
+
+            }
+
+            // Data Structure Version
+            {
+
+                data_structure_version = data.get("data_structure_version");
+
+                if (data_structure_version == null) {
+
+                    Error.add("pack", "packs / missing data_structure_version", pack.getPath(), pack.getName() + " > " + data_structure_version);
+                    pass = false;
+
+                } else {
+
+                    if (Core.data_structure_version_pack.equals(data_structure_version) == false) {
+
+                        Error.add("pack", "packs / unsupported data structure version. This will results skipping these packs. Your version is " + Core.data_structure_version_pack + " but these packs require a different version.", pack.getPath(), pack.getName() + " > " + data_structure_version);
+                        pass = false;
+
+                    }
+
+                }
+
+            }
+
+            // Required Packs
+            {
+
+                required_packs = data.get("required_packs");
+
+                if (required_packs == null) {
+
+                    Error.add("pack", "packs / missing required_packs", pack.getPath(), pack.getName() + " > " + data_structure_version);
+                    pass = false;
+
+                } else {
+
+                    if (required_packs.isEmpty() == false) {
+
+                        for (String scan : required_packs.split(" / ")) {
+
+                            // [修复] 如果包列表中包含自己，跳过验证
+                            // 防止主包因为引用自己而被标记为不兼容
+                            if (scan.equals(pack_id)) {
+                                continue;
+                            }
+
+                            boolean found = false;
+                            
+                            // 0. 预处理：去除依赖 ID 前后的空格
+                            scan = scan.trim();
+                            
+                            // 1. 首先检查 cache_pack_files (Key=pack_id, Value=File)
+                            if (cache_pack_files.containsKey(scan)) {
+                                found = true;
+                            } else {
+                                // 1.1 尝试不区分大小写匹配（防止 ID 大小写不一致）
+                                for (String id : cache_pack_files.keySet()) {
+                                    if (id.equalsIgnoreCase(scan)) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // 2. 如果在已注册列表中没找到（可能依赖包还没加载），遍历所有包进行匹配
+                            if (!found) {
+                                for (File p : packs) {
+                                    // 2.1 匹配文件名（忽略大小写和扩展名）
+                                    String fileName = p.getName().toLowerCase();
+                                    String scanLower = scan.toLowerCase();
+                                    if (fileName.equals(scanLower) || fileName.startsWith(scanLower + ".")) {
+                                        found = true;
+                                        break;
+                                    }
+                                    
+                                    // 2.2 尝试读取 info.txt 中的 pack_id 来匹配
+                                    File infoFile = null;
+                                    if (p.getName().endsWith(".zip")) {
+                                        infoFile = new File(Core.path_config + "/dev/temporary/pack_zip/" + p.getName() + "/info.txt");
+                                    } else {
+                                        infoFile = new File(p.getPath() + "/info.txt");
+                                    }
+                                    if (infoFile != null && infoFile.exists()) {
+                                        Map<String, String> d = OutsideUtils.convertFileToDataMap(infoFile.toString());
+                                        if (d != null) {
+                                            String p_id = d.get("pack_id");
+                                            // 如果 ID 不为空，进行不区分大小写匹配
+                                            if (p_id != null && !p_id.isEmpty()) {
+                                                if (p_id.equalsIgnoreCase(scan)) {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if (!found) {
+                                Error.add("pack", "packs / required packs not found. This will results skipping these packs. Make sure you install required packs to allow these packs to work.", pack.getPath(), pack.getName() + " > " + scan);
+                                pass = false;
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            // Required Mods
+            {
+
+                required_mods = data.get("required_mods");
+
+                if (required_mods == null) {
+
+                    Error.add("pack", "packs / missing required_mods", pack.getPath(), pack.getName() + " > " + data_structure_version);
+                    pass = false;
+
+                } else {
+
+                    if (required_mods.isEmpty() == false) {
+
+                        for (String scan : required_mods.split(" / ")) {
+
+                            if (GameUtils.Misc.isModLoaded(scan) == false) {
+
+                                Error.add("pack", "packs / required mods not found. This will results skipping these packs. Make sure you install required mods to allow these packs to work.", pack.getPath(), pack.getName() + " > " + scan);
+                                pass = false;
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            if (pass == false) {
+
+                FileManager.rename(pack.getPath(), "[INCOMPATIBLE] " + pack.getName());
+                cache_pack_ids.remove(pack.getName());
+                cache_pack_ids.put("[INCOMPATIBLE] " + pack.getName(), pack_id);
+
+            }
+
+        }
+
+    }
+
+    private static void test (ServerLevel level_server, String folders, boolean is_function) {
+
+        for (String folder : folders.split(" / ")) {
+
+            String suffix = "";
+
+            if (folder.contains(" < ") == true) {
+
+                String[] split = folder.split(" < ");
+                folder = split[0];
+                suffix = split[1];
+
+            }
+
+            File file = new File(Core.path_config + "/dev/temporary/" + folder);
+
+            if (file.exists() == true) {
+
+                for (File scan : FileManager.getAllFiles(file.getPath())) {
+
+                    {
+
+                        if (scan.getName().startsWith("[INCOMPATIBLE] ") == false && scan.getName().endsWith(suffix + ".txt") == true) {
+
+                            Option.testParse(level_server, scan, is_function);
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    // [MODS-CONFIG] 主包识别: 内置包名固定是 "#main.zip" / "#main", 解压目录里带 zip 后缀时也认.
+    private static boolean isMainPack (File pack) {
+
+        return pack != null && pack.getName().matches("^(\\[INCOMPATIBLE\\] )?#main(\\.zip)?$");
+
+    }
+
+    private static void organize (File pack, String pack_separate_multiple) {
+
+        boolean incompatible = pack.getName().startsWith("[INCOMPATIBLE] ") == true;
+
+        // Get Real Pack Path
+        {
+
+            if (pack.getName().endsWith(".zip") == true) {
+
+                pack = new File(Core.path_config + "/dev/temporary/pack_zip/" + pack.getName());
+
+            }
+
+        }
+
+        File[] files = pack.listFiles();
+
+        if (files == null) {
+
+            return;
+
+        }
+
+        boolean is_separate_multiple = false;
+
+        // [修复] 提前获取 pack_id，如果为 null 使用包名作为 fallback
+        // [MODS-CONFIG] pack_id 来自各包根目录的 info.txt (pack_id = ...). 如果因为 info.txt 缺失/损坏
+        // 回退成文件名, 主包会变成 "#main.zip" 而 world_gen 里写的是 "presets/#main/...", 差一个 .zip
+        // 就整包解析不到 (零树). 这里给主包一个稳定兜底 id, 其它包仍按原逻辑.
+        // 注意: 上方解压分支已把 pack 换成 ".../pack_zip/<zip 名>", 名字仍以 .zip 结尾, isMainPack 认这个形态.
+        boolean is_main_pack = isMainPack(pack);
+        String pack_id = cache_pack_ids.get(pack.getName());
+        if (pack_id == null || is_main_pack == true) {
+            // 主包强制用真实 id: world_gen 的 path_settings 写死 "presets/#main/...",
+            // 一旦回退成文件名 (#main.zip / 解压目录名), 整个主包就解析不到 -> 零树.
+            pack_id = is_main_pack == true ? "#main" : pack.getName();
+            if (is_main_pack == false && Core.debug_log) {
+                Core.logger.warn("[THT] pack_id is null for pack: " + pack.getName() + ", using filename as fallback");
+            }
+        }
+
+        for (File file : files) {
+
+            if (file.isDirectory() == true) {
+
+                is_separate_multiple = pack_separate_multiple.contains(" / " + file.getName() + " / ") == true;
+                boolean is_separate_multiple_final = is_separate_multiple;
+
+                for (File scan : FileManager.getAllFiles(file.getPath())) {
+
+                    {
+
+                        Path path_copy_to = Path.of(Core.path_config + "/dev/temporary/" + file.getName());
+
+                        // Convert Path
+                        {
+
+                            if (is_separate_multiple_final == true) {
+
+                                path_copy_to = path_copy_to.resolve(pack_id);
+
+                            }
+
+                            path_copy_to = path_copy_to.resolve(pack.toPath().resolve(file.getName()).relativize(scan.toPath()));
+
+                            if (incompatible == true) {
+
+                                path_copy_to = path_copy_to.getParent().resolve("[INCOMPATIBLE] " + path_copy_to.toFile().getName());
+
+                            }
+
+                        }
+
+                        FileManager.copy(scan.getPath(), path_copy_to.toString(), false);
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+    public static class Option {
+
+        private static boolean testParse (ServerLevel level_server, File file, boolean is_function) {
+
+            boolean pass = true;
+            String id = Path.of(Core.path_config + "/dev/temporary/").relativize(file.toPath()).toString().replace("\\", "/");
+            String[] split = null;
+            String option = "";
+            String value = "";
+            File file_test = null;
+
+            for (String scan : FileManager.readTXT(file.getPath())) {
+
+                if (scan.contains(" = ") == true) {
+
+                    split = scan.split(" = ");
+
+                    // Parsing
+                    {
+
+                        try {
+
+                            option = split[0];
+                            value = split[1];
+
+                        } catch (Exception exception) {
+
+                            OutsideUtils.exception(new Exception(), exception, "");
+                            Error.add("file", "setting files / option parsing error. This will results skipping them in mod systems.", file.getPath(), id + " > " + Arrays.toString(split));
+                            pass = false;
+
+                        }
+
+                    }
+
+                    if (is_function == true) {
+
+                        // TODO
+
+                    } else {
+
+                        {
+
+                            if (value.equals("none") == false) {
+
+                                if (option.startsWith("path_") == true) {
+
+                                    {
+
+                                        option = option.substring("path_".length()).replace("_", " ");
+                                        file_test = new File(Core.path_config + "/dev/temporary/" + value);
+
+                                        if (file_test.exists() == true) {
+
+                                            if (file_test.listFiles() == null) {
+
+                                                Error.add("file", "settings files / empty " + option + " folder. This will results skipping them in mod systems.", file.getPath(), id);
+                                                pass = false;
+
+                                            }
+
+                                        } else {
+
+                                            file_test = new File(file_test.getPath() + ".txt");
+
+                                            if (file_test.exists() == false) {
+
+                                                Error.add("file", "world gen files / " + option + " path not found. This will results skipping them in mod systems.", file.getPath(), id + " > " + value);
+                                                pass = false;
+
+                                            }
+
+                                        }
+
+                                    }
+
+                                } else if (option.startsWith("Block ") == true) {
+
+                                    {
+
+                                        if (level_server != null) {
+
+                                            value = value.replace(" keep", "");
+
+                                            if (GameUtils.Tile.fromText(level_server, value).isAir() == true) {
+
+                                                Error.add("file", "settings file / unknown block IDs. This will results skipping them in mod systems.", file.getPath(), id + " > " + value);
+                                                pass = false;
+
+                                            }
+
+                                        }
+
+                                    }
+
+                                } else if (option.startsWith("Function ") == true) {
+
+                                    {
+
+                                        file_test = new File(Core.path_config + "/dev/temporary/" + value + ".txt");
+
+
+                                        if (file_test.exists() == false) {
+
+                                            Error.add("file", "settings file / unknown functions. This will results skipping them in mod systems.", file.getPath(), id + " > " + value);
+                                            pass = false;
+
+                                        } else {
+
+                                            if (testParse(level_server, file_test, true) == false) {
+
+                                                Error.add("file", "settings files / functions is mark as incompatible. This will results skipping them in mod systems.", file.getPath(), id);
+                                                pass = false;
+
+                                            }
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            return pass;
+
+        }
+
+    }
+
+    public static class Error {
+
+        private static void add (String type, String error, String path, String troublemaker) {
+
+            errors.computeIfAbsent(type, create -> new HashMap<>()).computeIfAbsent(error, create -> new HashSet<>()).add(troublemaker);
+            cache_error_files.add(path);
+
+        }
+
+        public static void sendMessage (ServerLevel level_server) {
+
+            boolean to_chat = false;
+            String message = "";
+            String[] split = null;
+            boolean first = true;
+
+            for (Map.Entry<String, Map<String, Set<String>>> entry1 : errors.entrySet()) {
+
+                to_chat = level_server != null && (entry1.getKey().equals("pack") == true || Core.developer_mode == true);
+
+                // First Line
+                {
+
+                    if (first == true) {
+
+                        first = false;
+
+                        if (to_chat == false) {
+
+                            Core.logger.error("----------------------------------------------------------------------------------------------------");
+
+                        }
+
+                    }
+
+                }
+
+                for (Map.Entry<String, Set<String>> entry2 : entry1.getValue().entrySet()) {
+
+                    {
+
+                        split = entry2.getKey().split(" / ");
+                        message = "Detected incompatible " + split[0] + ", caused by " + split[1];
+
+                        if (to_chat == true) {
+
+                            GameUtils.Misc.sendChatMessage(level_server, message + " / red");
+
+                        } else {
+
+                            Core.logger.error(message);
+
+                        }
+
+                        for (String get : entry2.getValue()) {
+
+                            if (to_chat == true) {
+
+                                GameUtils.Misc.sendChatMessage(level_server, get + " / dark_gray");
+
+                            } else {
+
+                                Core.logger.error("- {}", get);
+
+                            }
+
+                        }
+
+                        if (to_chat == false) {
+
+                            Core.logger.error("----------------------------------------------------------------------------------------------------");
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
+
+    }
+
+}
