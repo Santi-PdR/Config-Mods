@@ -16,29 +16,34 @@ mod/                        proyecto Gradle completo (Forge 1.20.1 · 47.4.10)
 
 ## 1. Configurar en qué dimensiones aparece el mod
 
-Archivo: `config/tanshugetrees/config.toml` (se genera solo al arrancar; también se puede tocar en el
-servidor dedicado, en la carpeta `config/` de la instancia).
+Archivo: `config/tanshugetrees/config.toml` (se genera solo al arrancar).
 
 ```toml
 world_gen_dimensions_mode = 'whitelist'
 world_gen_dimensions = 'minecraft-overworld'
 ```
 
-- `world_gen_dimensions_mode = 'whitelist'` → el mod **solo** funciona en las dimensiones listadas.
-- `world_gen_dimensions_mode = 'blacklist'` → el mod funciona en todas **menos** las listadas.
-- `world_gen_dimensions` → lista separada por ` / ` (o comas). Nombres = id de dimensión con `:` cambiado
-  por `-`, tal como aparecen en el log del servidor:
+- `world_gen_dimensions_mode`:
+  - `'whitelist'` → el mod **solo** funciona en las dimensiones listadas.
+  - `'blacklist'` → el mod funciona en todas **menos** las listadas.
+- `world_gen_dimensions` → lista separada por ` / ` o comas. Nombres = id de dimensión tal como sale en el
+  log, con `:` cambiado por `-` (también se acepta con `:`).
+- **Funciona con cualquier dimensión**, vanilla o de mod, y soporta comodines:
 
-| Dimensión | Valor a escribir |
+| Ejemplo | Significado |
 |---|---|
-| Overworld | `minecraft-overworld` |
-| Nether | `minecraft-the_nether` |
-| End | `minecraft-the_end` |
-| Aether | `aether-the_aether` |
-| Twilight Forest | `twilightforest-twilight_forest` |
-| Cualquiera (default) | `*` |
+| `minecraft-overworld` | solo el Overworld |
+| `minecraft-overworld / minecraft-the_nether` | Overworld y Nether |
+| `aether-the_aether` | The Aether |
+| `twilightforest-twilight_forest` | Twilight Forest |
+| `deeperdarker-otherside` | Deeper and Darker |
+| `twilightforest-*` | **todas** las dimensiones de Twilight Forest |
+| `*-the_aether` | cualquier dimensión llamada `the_aether` (de cualquier mod) |
+| `minecraft-the_*` | `the_nether`, `the_end`, `the_void`… |
+| `minecraft-*` | solo vanilla (todo lo de mods queda fuera) |
+| `*` | todas (default, comportamiento original) |
 
-Ejemplos:
+Recetas típicas:
 
 ```toml
 # Solo Overworld: Aether, Twilight Forest, Nether, End y cualquier dimensión de mod quedan sin árboles
@@ -47,24 +52,32 @@ world_gen_dimensions = 'minecraft-overworld'
 ```
 
 ```toml
-# Todo menos Aether
+# Todo menos Aether y Twilight Forest
 world_gen_dimensions_mode = 'blacklist'
-world_gen_dimensions = 'aether-the_aether'
+world_gen_dimensions = 'aether-the_aether / twilightforest-*'
 ```
+
+Comandos en juego (nivel de permiso 2, o desde la consola del servidor):
+
+| Comando | Para qué |
+|---|---|
+| `/tanshugetrees dimensions_list` | lista **todas** las dimensiones que tiene el servidor, con su ID exacto y si están `ON`/`OFF` según el filtro actual |
+| `/tanshugetrees dimensions_reload` | relee los dos valores de `config.toml` sin reiniciar el mundo |
+| `/tanshugetrees restart` | recarga todo el mod |
 
 Notas:
 
-- Si el jugador escribe `minecraft:overworld` (con dos puntos) también funciona: se normaliza.
-- Lista vacía o `*` = sin filtro (comportamiento original).
+- Lista vacía o `*` = sin filtro (comportamiento original). Si la config está mal escrita, se cae al
+  comportamiento sin filtro en vez de dejar el mundo sin árboles.
 - El filtro se aplica en **cuatro puntos** del pipeline: la feature de worldgen
   (`WorldGenStepBeforePlants.place`), `WorldGen.stepBeforePlants`, la carga de chunk
-  (`EventCenter.eventChunkLoaded`) y la cola de colocación
+  (`EventCenter.eventChunkLoaded`), y la cola de colocación / pregeneración
   (`TreePlacer.start`, `DeferredQueue.add/addForced`, `PregenObserver`). Una dimensión excluida no lee
-  disco, no encola trabajo y no genera regiones: no hay costo de CPU ni de memoria.
-- Al arrancar el servidor queda una línea de log con el filtro efectivo:
+  disco, no encola trabajo y no genera regiones: cero costo de CPU y memoria.
+- La consulta está memoizada por dimensión (el worldgen la llama una vez por chunk).
+- Al arrancar queda una línea con el filtro efectivo:
   `[THT] World generation dimensions: whitelist [minecraft-overworld]`.
-- Para aplicar cambios sin reiniciar el mundo: `/tanshugetrees dimensions_reload`.
-  (Los árboles ya generados no se borran; las dimensiones excluidas dejan de generar nuevos.)
+- Los árboles ya generados no se borran al cambiar la config.
 
 ## 2. Saplings que se quedaban congelados y spam en consola
 
@@ -120,6 +133,21 @@ error; los primeros avisos siguen apareciendo completos.
 
 ## 4. Compilar
 
+### En GitHub (recomendado, no hace falta instalar nada)
+
+Workflow: `.github/workflows/build.yml` (Actions → **Build mod jar** → *Run workflow*).
+
+1. Entrá a la pestaña **Actions** del repo → `Build mod jar` → **Run workflow** (podés cambiar el sufijo
+   del nombre del jar, por defecto `configmods`).
+2. Cuando termina (~5-10 min), el jar queda en **Artifacts → `tanshugetrees-jar`**:
+   `TansHugeTrees-1.8.0-Forge-1.20.1-configmods.jar`.
+3. Alternativa: creá un tag (`git tag v1.1 && git push origin v1.1`) y el workflow adjunta el jar a una
+   **release en borrador** automáticamente, lista para publicar.
+
+El workflow usa JDK 17 (Temurin), cachea Gradle y compila con `./gradlew build`.
+
+### En tu máquina
+
 Requiere **JDK 17**:
 
 ```bash
@@ -130,14 +158,13 @@ cd mod
 El jar sale en `mod/build/libs/tanshugetrees-1.8.0-<timestamp>.jar`.
 
 > El entorno donde se preparó este código no tenía JDK ni acceso a `maven.minecraftforge.net`, así que
-> **el jar no está compilado aquí**: hay que compilarlo en una máquina con JDK 17 e internet. Los fuentes
-> modificados se validaron sintácticamente (parser Java) y contra la base original, pero no se ejecutó
-> `gradlew build`.
+> **el jar no está compilado aquí**: se compila con el workflow de GitHub o localmente con JDK 17. Los
+> fuentes modificados se validaron sintácticamente (parser Java) y contra la base original.
 
 ## 5. Licencia / créditos
 
 - Mod original: **TannyJung** — *Tan's Huge Trees* (All Rights Reserved).
 - Fixes de rendimiento/correctitud de la base: **LMaxRouterCN**.
-- Los cambios de este repositorio son parches sobre esa base. El README del fork indica que las
-  compilaciones sólo deben publicarse con permiso explícito del autor original: **no publiques un jar
-  derivado sin esa autorización**.
+- Los cambios de este repositorio son parches sobre esa base. **El autor original dio permiso explícito
+  para distribuir esta compilación** (por eso el workflow puede adjuntar el jar a una release). Conviene
+  mantener el crédito a TannyJung y a LMaxRouterCN en la descripción de la release.

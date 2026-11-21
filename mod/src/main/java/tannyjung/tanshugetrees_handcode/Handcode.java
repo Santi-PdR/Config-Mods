@@ -117,7 +117,7 @@ public class Handcode {
         // dimension 字符串 = ResourceLocation 把 ':' 换成 '-' (例: minecraft-overworld).
         public static String world_gen_dimensions = "*";
         public static String world_gen_dimensions_mode = "whitelist";
-        private static Set<String> world_gen_dimensions_parsed = new HashSet<>();
+        private static Set<String> world_gen_dimensions_parsed = new java.util.LinkedHashSet<>();
         private static boolean world_gen_dimensions_all = true;
         // 每区块都会问一次 isDimensionAllowed(): 缓存判定结果, 避免在 worldgen 热路径上反复规范化字符串
         private static final Map<String, Boolean> world_gen_dimensions_cache = new java.util.concurrent.ConcurrentHashMap<>();
@@ -311,12 +311,46 @@ public class Handcode {
             # 取消生成中心高于此 Y 坐标的树. 部分 world gen 模组(如 ReTerraForged)会替换山体方块, 本模组无法识别这些新方块导致树生成在列表外方块上. 设 0 关闭此功能.
 
             world_gen_dimensions_mode = 'whitelist'
-            # How world_gen_dimensions is read. "whitelist" = the mod only works in the listed dimensions (default). "blacklist" = the mod works everywhere EXCEPT the listed dimensions. Use "*" inside the list to mean "every dimension".
-            # 维度列表的解读方式. "whitelist"=白名单: 模组只在列出的维度生效(默认). "blacklist"=黑名单: 除列出的维度外全都生效. 列表里写 "*" 表示所有维度.
+            # How the world_gen_dimensions list is read.
+            #   'whitelist' = the mod works ONLY in the listed dimensions (default).
+            #   'blacklist' = the mod works everywhere EXCEPT the listed dimensions.
+            # 维度列表的解读方式:
+            #   'whitelist' = 白名单: 模组只在列出的维度生效 (默认).
+            #   'blacklist' = 黑名单: 除列出的维度外全都生效.
 
             world_gen_dimensions = '*'
-            # Dimensions where the mod is allowed to generate trees (world gen) and place tree blocks. Separate with " / " or ",". Names are the dimension ID with ":" replaced by "-", for example: minecraft-overworld / minecraft-the_nether / minecraft-the_end / twilightforest-twilight_forest. Default '*' = every dimension (vanilla behavior). To play only in the Overworld (and keep Aether, Twilight Forest or any modded dimension clean) use mode 'whitelist' and list just minecraft-overworld.
-            # 允许本模组生成树(世界生成与方块放置)的维度. 用 " / " 或逗号分隔. 写法=维度ID把 ":" 换成 "-", 例如 minecraft-overworld / minecraft-the_nether / minecraft-the_end / twilightforest-twilight_forest. 默认 '*'=所有维度(与原版一致). 若只想在主世界生成(让 Aether、暮色森林等模组维度保持干净), 用 mode 'whitelist' 只写 minecraft-overworld 即可. 需要重启或 /restart 生效.
+            # Dimensions where trees may generate and tree blocks may be placed. Separate entries with " / " or commas.
+            # A dimension ID is written exactly as in the log, but ":" is normally replaced by "-":
+            #   minecraft-overworld            Overworld / 主世界
+            #   minecraft-the_nether           Nether / 下界
+            #   minecraft-the_end              End / 末地
+            #   aether-the_aether              The Aether
+            #   twilightforest-twilight_forest Twilight Forest / 暮色森林
+            #   deeperdarker-otherside         Deeper and Darker
+            # ":" also works (minecraft:overworld), both forms are accepted.
+            # Wildcards are supported, so modded dimensions do not need to be listed one by one:
+            #   twilightforest-*               every dimension of that mod / 该模组的所有维度
+            #   *-the_aether                   any namespace that has a dimension named the_aether
+            #   minecraft-the_*                all vanilla "the_..." dimensions
+            #   *                              everything (default, same as the original mod)
+            # Examples / 示例:
+            #   Only the Overworld / 只在主世界:
+            #     world_gen_dimensions_mode = 'whitelist'
+            #     world_gen_dimensions = 'minecraft-overworld'
+            #   Overworld + Nether, nothing else / 主世界+下界:
+            #     world_gen_dimensions = 'minecraft-overworld / minecraft-the_nether'
+            #   Everything except The Aether and Twilight Forest / 除了以太和暮色森林:
+            #     world_gen_dimensions_mode = 'blacklist'
+            #     world_gen_dimensions = 'aether-the_aether / twilightforest-*'
+            #   Only vanilla dimensions (all modded dimensions off) / 只要原版维度:
+            #     world_gen_dimensions = 'minecraft-*'
+            # Use [ /tanshugetrees dimensions_list ] in game to print every dimension ID the server has.
+            # Changes apply with [ /tanshugetrees dimensions_reload ] or a restart. Trees already generated are not removed.
+            # 允许生成树的维度(世界生成与方块放置). 用 " / " 或逗号分隔.
+            # 维度 ID 写法=日志里的 ID 把 ":" 换成 "-" (两种写法都接受). 支持通配符:
+            #   twilightforest-* = 该模组所有维度; *-the_aether = 任意命名空间下叫 the_aether 的维度; '*' = 全部(默认).
+            # 游戏内用 [ /tanshugetrees dimensions_list ] 可列出服务器上所有维度 ID 及其当前开关状态.
+            # 改完用 [ /tanshugetrees dimensions_reload ] 或重启生效. 已经生成的树不会消失.
 
             unviable_ecology_skip_chance = 0.75
             # Skip trees that generate in unviable ecosystems. For example, land trees that generate in water. This config only affect to dead trees, as normal trees already skip generate in unviable ecosystems.
@@ -574,7 +608,13 @@ public class Handcode {
         // ===== [MODS-CONFIG] 维度过滤 / Dimension filter =====
         // 说明: "dimension" 字符串在本模组里统一是 ResourceLocation 把 ':' 换成 '-' 的形式
         // (例: minecraft:the_nether -> minecraft-the_nether), 因为同一字符串还被当目录名用.
-        // 这里同时接受 ':' 与 '-' 两种写法, 方便服主从别的配置文件里直接抄维度 ID.
+        // 这里两种写法都接受, 并且支持通配符, 这样任何模组维度都能配置:
+        //   minecraft-overworld            精确匹配
+        //   aether-the_aether              精确匹配 (Aether)
+        //   twilightforest-*               整个模组的所有维度
+        //   *-the_aether                   任意命名空间里叫 the_aether 的维度
+        //   aether-* / minecraft-the_*     其它组合
+        //   *                              全部 (默认)
 
         private static String normalizeDimensionKey (String raw) {
 
@@ -584,7 +624,7 @@ public class Handcode {
 
             }
 
-            String key = raw.trim().toLowerCase(java.util.Locale.ROOT);
+            String key = raw.trim().toLowerCase(java.util.Locale.ROOT).replace(" ", "");
 
             while (key.startsWith("/") == true) {
 
@@ -598,13 +638,64 @@ public class Handcode {
 
             }
 
-            return key.replace(":", "-").replace(" ", "");
+            return key.replace(":", "-");
+
+        }
+
+        /** 通配符匹配: '*' = 任意长度, '?' = 单个字符. 其余字符按字面比较 (维度 ID 里只有 [a-z0-9_.-/]). */
+        private static boolean wildcardMatch (String pattern, String value) {
+
+            if (pattern.indexOf('*') < 0 && pattern.indexOf('?') < 0) {
+
+                return pattern.equals(value);
+
+            }
+
+            StringBuilder regex = new StringBuilder();
+
+            for (char character : pattern.toCharArray()) {
+
+                if (character == '*') {
+
+                    regex.append(".*");
+
+                } else if (character == '?') {
+
+                    regex.append('.');
+
+                } else {
+
+                    regex.append(java.util.regex.Pattern.quote(String.valueOf(character)));
+
+                }
+
+            }
+
+            return value.matches(regex.toString());
+
+        }
+
+        private static boolean matchesDimensionList (String key) {
+
+            String key_colon = key.replace('-', ':');
+
+            for (String pattern : world_gen_dimensions_parsed) {
+
+                if (wildcardMatch(pattern, key) == true || wildcardMatch(pattern, key_colon) == true) {
+
+                    return true;
+
+                }
+
+            }
+
+            return false;
 
         }
 
         public static void applyDimensions (String list, String mode) {
 
-            Set<String> parsed = new HashSet<>();
+            Set<String> parsed = new java.util.LinkedHashSet<>();
             String current_mode = mode == null ? "" : mode.trim().toLowerCase(java.util.Locale.ROOT);
             world_gen_dimensions_mode = "blacklist".equals(current_mode) == true ? "blacklist" : "whitelist";
 
@@ -613,6 +704,16 @@ public class Handcode {
                 for (String scan : list.split("[/,;|\n\r]")) {
 
                     String key = scan.replace("'", "").replace("\"", "").trim();
+
+                    // 行尾注释 (用户在 TOML 里手写时可能出现) 一并丢掉
+                    int comment = key.indexOf('#');
+
+                    if (comment >= 0) {
+
+                        key = key.substring(0, comment);
+
+                    }
+
                     key = normalizeDimensionKey(key);
 
                     if (key.isEmpty() == false) {
@@ -643,6 +744,7 @@ public class Handcode {
         /**
          * 该维度是否允许本模组工作. 所有世界生成/放置入口都应该先问这里.
          * 未知/空维度 = 放行 (fail-open), 避免因为字符串异常彻底静默.
+         * 支持通配符, 见类头说明; 因此模组维度 (Aether, Twilight Forest, 自定义维度 ...) 都能精确或按命名空间排除.
          */
         public static boolean isDimensionAllowed (String dimension) {
 
@@ -668,7 +770,7 @@ public class Handcode {
 
             }
 
-            boolean listed = world_gen_dimensions_parsed.contains(key);
+            boolean listed = matchesDimensionList(key);
             boolean allowed = "blacklist".equals(world_gen_dimensions_mode) == true ? listed == false : listed;
 
             // 维度数量是有限且很小的 (主世界/下界/末地 + 模组维度), 缓存不会膨胀
@@ -688,6 +790,32 @@ public class Handcode {
             }
 
             return world_gen_dimensions_mode + " " + new java.util.TreeSet<>(world_gen_dimensions_parsed);
+
+        }
+
+        /**
+         * 服务器上实际存在的维度 ID (命令用): 让服主不用猜就能把名字抄进 config.toml.
+         */
+        public static java.util.List<String> listServerDimensions (net.minecraft.server.MinecraftServer server) {
+
+            java.util.List<String> out = new java.util.ArrayList<>();
+
+            if (server == null) {
+
+                return out;
+
+            }
+
+            for (net.minecraft.server.level.ServerLevel level : server.getAllLevels()) {
+
+                String id = level.dimension().location().toString();
+                out.add(id.replace(":", "-") + "  ( " + id + " )  " + (isDimensionAllowed(id) == true ? "ON" : "OFF"));
+
+            }
+
+            java.util.Collections.sort(out);
+
+            return out;
 
         }
 

@@ -1,0 +1,100 @@
+name: Build mod jar
+
+# Compila TansHugeTrees 1.20.1 (Forge 47.4.10) y deja el jar como artefacto descargable.
+# Se puede lanzar a mano (Actions -> Build mod jar -> Run workflow) y también al crear un tag v*.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: "Sufijo opcional para el nombre del jar (ej: configmods)"
+        required: false
+        default: "configmods"
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "mod/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Gradle build (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # El repo no incluye gradle-wrapper.jar en todas las ramas: si falta, se genera con la versión del proyecto.
+      - name: Ensure Gradle wrapper
+        run: |
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            GRADLE_VERSION="$(sed -n 's#.*gradle-\(.*\)-bin.zip#\1#p' gradle/wrapper/gradle-wrapper.properties | head -1)"
+            echo "Generando wrapper para Gradle ${GRADLE_VERSION}"
+            curl -sSLo /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+            unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
+            /tmp/gradle-dist/gradle-${GRADLE_VERSION}/bin/gradle wrapper --gradle-version "${GRADLE_VERSION}" --distribution-type bin
+          fi
+          chmod +x gradlew
+
+      - name: Configure Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('mod/gradle/wrapper/gradle-wrapper.properties', 'mod/build.gradle') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build
+        run: ./gradlew build --stacktrace --no-daemon
+        env:
+          # Menos presión de memoria en runners de 7 GB (MCreator/Forge tiran mucho)
+          GRADLE_OPTS: "-Xmx4G"
+
+      - name: Show produced jars
+        run: ls -la build/libs
+
+      - name: Rename jar
+        id: jar
+        run: |
+          SUFFIX="${{ github.event.inputs.version_suffix }}"
+          if [ -z "$SUFFIX" ]; then SUFFIX="configmods"; fi
+          SRC="$(ls build/libs/*.jar | grep -v -- '-sources' | grep -v -- '-dev' | head -1)"
+          OUT="TansHugeTrees-1.8.0-Forge-1.20.1-${SUFFIX}.jar"
+          cp "$SRC" "$OUT"
+          echo "path=${OUT}" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+          sha256sum "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanshugetrees-jar
+          path: mod/${{ steps.jar.outputs.path }}
+          if-no-files-found: error
+
+      # Al empujar un tag v* también queda adjunto a una release (borrador) lista para publicar.
+      - name: Attach jar to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mod/${{ steps.jar.outputs.path }}
+          draft: true
+          generate_release_notes: true

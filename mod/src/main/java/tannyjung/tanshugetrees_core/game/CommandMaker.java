@@ -249,7 +249,8 @@ public class CommandMaker {
             CommandMaker.create(event_object, 2, Core.mod_id_big + " / pack / check_update_main", run.pack::check_update_main);
             CommandMaker.create(event_object, 2, Core.mod_id_big + " / pack / update_main", run.pack::update_main);
             CommandMaker.create(event_object, 2, Core.mod_id_big + " / restart", run::restart);
-            // [MODS-CONFIG] 只重读维度白/黑名单, 不重启世界 (改完 config.toml 不想全员被踢时用这个)
+            // [MODS-CONFIG] 维度白/黑名单: 列出服务器维度 + 不重启就重读配置
+            CommandMaker.create(event_object, 2, Core.mod_id_big + " / dimensions_list", run::dimensions_list);
             CommandMaker.create(event_object, 2, Core.mod_id_big + " / dimensions_reload", run::dimensions_reload);
 
         }
@@ -302,6 +303,21 @@ public class CommandMaker {
 
                 ServerLevel level_server = data.getSource().getLevel();
                 Core.restart(level_server, true, true);
+
+            }
+
+            private static void dimensions_list (CommandContext<CommandSourceStack> data) {
+
+                CommandSourceStack source = data.getSource();
+                java.util.List<String> dimensions = tannyjung.tanshugetrees_handcode.Handcode.Config.listServerDimensions(source.getServer());
+                String filter = tannyjung.tanshugetrees_handcode.Handcode.Config.describeDimensionFilter();
+                source.sendSuccess(() -> net.minecraft.network.chat.Component.literal("[" + Core.mod_name + "] dimension filter: " + filter), false);
+
+                for (String line : dimensions) {
+
+                    source.sendSuccess(() -> net.minecraft.network.chat.Component.literal(" - " + line), false);
+
+                }
 
             }
 
